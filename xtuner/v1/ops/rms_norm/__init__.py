@@ -65,7 +65,7 @@ def get_zero_centered_rms_norm_fn() -> RMSNormProtocol:
         def _not_implemented(*args, **kwargs):
             raise NotImplementedError("Zero-centered RMSNorm is not implemented on NPU")
 
-        return _not_implemented
+        return native_zero_centered_rms_norm
     else:
         raise NotImplementedError(f"RMSNorm is not implemented on {device}")
 

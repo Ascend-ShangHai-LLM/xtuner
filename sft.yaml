@@ -1,0 +1,310 @@
+kind: 'Job'
+apiVersion: 'batch.volcano.sh/v1alpha1'
+metadata:
+  # name: 'hyf-3-qwen35-sdgs'
+  generateName: 'xn-qwen35-sp2-'
+  namespace: 'default'
+  uid: '338167cd-83ca-45a6-81d6-b6c1395987ca'
+  resourceVersion: 'MTQvMjAyNi0wNC0xMCAwMzo1NzozMC41NDE3MDUrMDA='
+  generation: 1
+  creationTimestamp: '2026-04-10T03:57:00Z'
+  labels:
+    lepton.sensetime.com/framework-type: 'PyTorch'
+    lepton.sensetime.com/submitter: 'linyifei.p'
+    ring-controller.atlas: 'ascend-910b'
+  annotations:
+    sp-block: '32'
+  managedFields:
+    - manager: 'kubectl-create'
+      operation: 'Update'
+      apiVersion: 'batch.volcano.sh/v1alpha1'
+      time: '2026-04-10T03:57:00Z'
+      fieldsType: 'FieldsV1'
+      fieldsV1:
+        f:metadata:
+          f:annotations:
+            .: {}
+            f:sp-block: {}
+          f:generateName: {}
+          f:labels:
+            .: {}
+            f:lepton.sensetime.com/framework-type: {}
+            f:lepton.sensetime.com/submitter: {}
+            f:ring-controller.atlas: {}
+        f:spec:
+          .: {}
+          f:maxRetry: {}
+          f:minAvailable: {}
+          f:plugins:
+            .: {}
+            f:hcclrank: {}
+            f:pytorch: {}
+            f:svc: {}
+          f:policies: {}
+          f:priorityClassName: {}
+          f:queue: {}
+          f:schedulerName: {}
+          f:tasks: {}
+    - manager: 'vc-controller-manager'
+      operation: 'Update'
+      apiVersion: 'batch.volcano.sh/v1alpha1'
+      time: '2026-04-10T03:57:30Z'
+      fieldsType: 'FieldsV1'
+      fieldsV1:
+        f:status:
+          .: {}
+          f:conditions: {}
+          f:controlledResources:
+            .: {}
+            f:plugin-pytorch: {}
+            f:plugin-svc: {}
+          f:minAvailable: {}
+          f:running: {}
+          f:state:
+            .: {}
+            f:lastTransitionTime: {}
+            f:phase: {}
+          f:taskStatusCount:
+            .: {}
+            f:master:
+              .: {}
+              f:phase:
+                .: {}
+                f:Running: {}
+            f:worker:
+              .: {}
+              f:phase:
+                .: {}
+                f:Running: {}
+      subresource: 'status'
+spec:
+  schedulerName: 'volcano'
+  minAvailable: 2
+  tasks:
+    - name: 'master'
+      replicas: 1
+      minAvailable: 1
+      template:
+        metadata:
+          # creationTimestamp: null
+          labels:
+            lepton.sensetime.com/submitter: 'linyifei.p'
+            ring-controller.atlas: 'ascend-910b'
+        spec:
+          volumes:
+            - name: '019ac01e-14ad-78e1-abec-a40d357556eb-mnt'
+              persistentVolumeClaim:
+                claimName: 'pvc-wvfnk'
+            - name: 'shm-data'
+              emptyDir:
+                medium: 'Memory'
+                sizeLimit: '960Gi'
+          containers:
+            - name: 'master'
+              # image: 'registry2.d.pjlab.org.cn/ccr-hw/910c:rl_s2_pre_003'
+              image: 'registry2.d.pjlab.org.cn/ccr-hw/910c:cann850b30-qwen35'
+              command:
+                - 'bash'
+                - '-c'
+              args:
+                - 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && export ASCEND_PROCESS_LOG_PATH=/mnt/huawei/wjw/rl_plog/$JOB_NAME/$RANK && cd /mnt/huawei/rl_qwen35/code/xtuner && bash qwen35_sft_debug.sh /mnt/huawei/rl_qwen35/code/xtuner/sft_config.py'
+              env:
+                - name: 'JOB_NAME'
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: 'metadata.labels[''volcano.sh/job-name'']'
+                - name: 'ASCEND_VISIBLE_DEVICES'
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: 'metadata.annotations[''huawei.com/Ascend910'']'
+              resources:
+                limits:
+                  cpu: '272'
+                  huawei.com/Ascend910: '16'
+                  memory: '1920Gi'
+                requests:
+                  cpu: '256'
+                  huawei.com/Ascend910: '16'
+                  memory: '1920Gi'
+              volumeMounts:
+                - name: '019ac01e-14ad-78e1-abec-a40d357556eb-mnt'
+                  mountPath: '/mnt'
+                - name: 'shm-data'
+                  mountPath: '/dev/shm'
+              imagePullPolicy: 'IfNotPresent'
+              securityContext:
+                capabilities:
+                  add:
+                    - 'IPC_LOCK'
+                privileged: true
+          restartPolicy: 'Never'
+          nodeSelector:
+            accelerator-type: 'module-910c-8'
+            host-arch: 'huawei-arm'
+          imagePullSecrets:
+            - name: 'ccr-hw-rl'
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: 'resource.compute.sensecore.cn/machine-type'
+                        operator: 'In'
+                        values:
+                          - 'h2ls.ru.k10'
+                          - 'host-10-140-216-99'
+                          - 'host-10-140-216-97'
+                          - 'host-10-140-216-88'
+                          - 'host-10-140-216-86'
+                          - 'host-10-140-216-81'
+                          - 'host-10-140-216-78'
+                          - 'host-10-140-216-77'
+                          - 'host-10-140-216-75'
+                          - 'host-10-140-216-71'
+                          - 'host-10-140-216-70'
+                          - 'host-10-140-216-67'
+                          - 'host-10-140-216-66'
+                          - 'host-10-140-216-118'
+                          - 'host-10-140-216-117'
+                          - 'host-10-140-216-113'
+                          - 'host-10-140-216-112'
+                          - 'host-10-140-216-111'
+                          - 'host-10-140-216-110'
+                          - 'host-10-140-216-107'
+                          - 'host-10-140-216-106'
+                          - 'host-10-140-216-103'
+                          - 'host-10-140-216-101'
+      policies:
+        - action: 'RestartJob'
+          event: 'PodEvicted'
+      maxRetry: 3
+    - name: 'worker'
+      replicas: 1
+      minAvailable: 1
+      template:
+        metadata:
+          # creationTimestamp: null
+          labels:
+            lepton.sensetime.com/submitter: 'linyifei.p'
+            ring-controller.atlas: 'ascend-910b'
+        spec:
+          volumes:
+            - name: '019ac01e-14ad-78e1-abec-a40d357556eb-mnt'
+              persistentVolumeClaim:
+                claimName: 'pvc-wvfnk'
+            - name: 'shm-data'
+              emptyDir:
+                medium: 'Memory'
+                sizeLimit: '960Gi'
+          containers:
+            - name: 'worker'
+              image: 'registry2.d.pjlab.org.cn/ccr-hw/910c:cann850b30-qwen35'
+              command:
+                - 'bash'
+                - '-c'
+              args:
+                - 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && export ASCEND_PROCESS_LOG_PATH=/mnt/huawei/wjw/rl_plog/$JOB_NAME/$RANK && cd /mnt/huawei/rl_qwen35/code/xtuner && bash qwen35_sft_debug.sh /mnt/huawei/rl_qwen35/code/xtuner/sft_config.py'
+              env:
+                - name: 'JOB_NAME'
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: 'metadata.labels[''volcano.sh/job-name'']'
+                - name: 'ASCEND_VISIBLE_DEVICES'
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: 'metadata.annotations[''huawei.com/Ascend910'']'
+              resources:
+                limits:
+                  cpu: '272'
+                  huawei.com/Ascend910: '16'
+                  memory: '1920Gi'
+                requests:
+                  cpu: '256'
+                  huawei.com/Ascend910: '16'
+                  memory: '1920Gi'
+              volumeMounts:
+                - name: '019ac01e-14ad-78e1-abec-a40d357556eb-mnt'
+                  mountPath: '/mnt'
+                - name: 'shm-data'
+                  mountPath: '/dev/shm'
+              imagePullPolicy: 'IfNotPresent'
+              securityContext:
+                capabilities:
+                  add:
+                    - 'IPC_LOCK'
+                privileged: true
+          restartPolicy: 'Never'
+          nodeSelector:
+            accelerator-type: 'module-910c-8'
+            host-arch: 'huawei-arm'
+          imagePullSecrets:
+            - name: 'ccr-hw-rl'
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: 'resource.compute.sensecore.cn/machine-type'
+                        operator: 'In'
+                        values:
+                          - 'h2ls.ru.k10'
+                          - 'host-10-140-216-99'
+                          - 'host-10-140-216-97'
+                          - 'host-10-140-216-88'
+                          - 'host-10-140-216-86'
+                          - 'host-10-140-216-81'
+                          - 'host-10-140-216-78'
+                          - 'host-10-140-216-77'
+                          - 'host-10-140-216-75'
+                          - 'host-10-140-216-71'
+                          - 'host-10-140-216-70'
+                          - 'host-10-140-216-67'
+                          - 'host-10-140-216-66'
+                          - 'host-10-140-216-118'
+                          - 'host-10-140-216-117'
+                          - 'host-10-140-216-113'
+                          - 'host-10-140-216-112'
+                          - 'host-10-140-216-111'
+                          - 'host-10-140-216-110'
+                          - 'host-10-140-216-107'
+                          - 'host-10-140-216-106'
+                          - 'host-10-140-216-103'
+                          - 'host-10-140-216-101'
+      policies:
+        - action: 'RestartJob'
+          event: 'PodEvicted'
+      maxRetry: 3
+  policies:
+    - action: 'RestartJob'
+      event: 'PodEvicted'
+  plugins:
+    hcclrank: []
+    pytorch:
+      - '--master=master'
+      - '--worker=worker'
+      - '--port=23456'
+    svc: []
+  queue: 'default'
+  maxRetry: 1
+  priorityClassName: 'normal'
+status:
+  state:
+    phase: 'Running'
+    lastTransitionTime: '2026-04-10T03:57:30Z'
+  minAvailable: 2
+  taskStatusCount:
+    master:
+      phase:
+        Running: 1
+    worker:
+      phase:
+        Running: 1
+  running: 2
+  controlledResources:
+    plugin-pytorch: 'pytorch'
+    plugin-svc: 'svc'
+  conditions:
+    - status: 'Pending'
+      lastTransitionTime: '2026-04-10T03:57:00Z'
+    - status: 'Running'
+      lastTransitionTime: '2026-04-10T03:57:30Z'

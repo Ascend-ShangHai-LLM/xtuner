@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 from xtuner.v1.ray.config import RolloutConfig
 
 from .worker import RolloutWorker
+import time
 
 
 def run_lmdeploy_server_wrapper(lmdeploy_config_namespace: Namespace):
@@ -167,8 +168,28 @@ class LMDeployWorker(RolloutWorker):
         assert response.status_code == 200, response.status_code
         return response.text
 
+    def _abort_all(self):
+        """Send an abort_all request to the lmdeploy inference engine."""
+        url = f"{self.server_url}/abort_request"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_keys}"}
+        response = requests.post(url, headers=headers, json={"abort_all": True}, timeout=10)
+        response.raise_for_status()
+
     def offload(self):
-        """Offloads the model weights and KV cache."""
+        """Offloads the model weights and KV cache.
+        Retries abort_all multiple times before sleeping to ensure all
+        in-flight requests are fully cleared, since lmdeploy's abort can
+        be unreliable under high concurrency.
+        """
+        max_retries = 5
+        retry_interval = 10
+        for i in range(max_retries):
+            try:
+                self._abort_all()
+            except Exception as e:
+                self.logger.warning(f"abort_all attempt {i + 1}/{max_retries} failed: {e}")
+            time.sleep(retry_interval)
+        self.logger.info(f"Sent {max_retries} abort_all requests before sleep.")
         return self._sleep(level=2)
 
     def wake_up(self, tags: List[str] | None = None):

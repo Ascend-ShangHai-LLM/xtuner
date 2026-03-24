@@ -332,6 +332,8 @@ class RolloutConfig(BaseModel):
         if self.max_retry_per_worker is None:
             self.max_retry_per_worker = self.rollout_max_batch_size_per_instance
 
+        print(f"====> rollout_max_batch_size_per_instance is {self.rollout_max_batch_size_per_instance}")
+
         self.worker_log_dir.mkdir(parents=True, exist_ok=True)
 
 

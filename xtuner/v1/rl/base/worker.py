@@ -221,6 +221,7 @@ class TrainingWorker(SingleAcceleratorWorker):
 
         self._set_deterministic()
         self._set_random_seed(worker_cfg.seed)
+        print(f"====> sp_size is {worker_cfg.sp_size}")
 
         self.data_mesh = self._init_data_mesh(sp_size=worker_cfg.sp_size)
         self.sp_mesh = self.data_mesh["sp"]

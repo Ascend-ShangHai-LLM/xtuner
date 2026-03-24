@@ -174,11 +174,16 @@ def get_apply_rotary_emb(
 
     device = get_device()
     if device == "npu":
-        assert not enable_partial_rotary, "Partial rotary is not supported on NPU yet."
-        if fope_sep_head:
-            return apply_rotary_pos_emb_sep_npu
+        assert fope_sep_head is None or not fope_sep_head, "FoPE with sep head is not supported on NPU yet."
+        # assert not enable_partial_rotary, "Partial rotary is not supported on NPU yet."
+        # return apply_rotary_pos_emb_npu
+        if enable_partial_rotary:
+            print("Using apply_rotary_pos_emb_cuda_for_partial_rotary on NPU, which is not optimized yet.")
+            return apply_rotary_pos_emb_cuda_for_partial_rotary
         else:
-            return apply_rotary_pos_emb_npu
+            print("Using apply_rotary_pos_emb_npu on NPU.")
+            return apply_rotary_pos_emb_cuda
+        
     else:
         if fope_sep_head:
             logger.debug("Using FoPE with fope_sep_head")

@@ -559,6 +559,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                     last_token_ids = response["output_ids"][-num_return_tokens:] if num_return_tokens > 0 else []
 
                 if self.enable_return_routed_experts and not extra_params.get("disable_routed_experts", False):
+                    # self.logger.info(f"response[meta_info][routed_experts]: {response['meta_info'].get('routed_experts', None)}, input_extra_info[routed_experts]: {input_extra_info.get('routed_experts', None)}")
                     assert "routed_experts" in response["meta_info"], (
                         "enable_return_routed_experts is True, but routed_experts is not in meta_info"
                     )

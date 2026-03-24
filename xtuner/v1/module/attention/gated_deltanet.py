@@ -13,10 +13,11 @@ from typing_extensions import overload
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
-from xtuner.v1.utils import get_logger
+from xtuner.v1.utils import get_logger, get_device
 
 from ..linear import build_linear
 from .attn_outputs import AttnOutputs
+from .causal_conv1d import causal_conv1d_triton
 
 
 # Temporary solution: use separate function objects for each call site, Dynamo will cache them separately
@@ -68,7 +69,13 @@ try:
 
 except ImportError:
     FusedRMSNormGated = None  # type: ignore
-    chunk_gated_delta_rule = None
+    from xtuner.v1.utils import get_device
+    DEVICE = get_device()
+
+    if DEVICE == "npu":
+        from .chunk_gated_delta_rule_npu.chunk_gated_delta_rule import chunk_gated_delta_rule
+    else:
+        chunk_gated_delta_rule = None
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -76,6 +83,27 @@ except ImportError:
     causal_conv1d_fn = None
 
 logger = get_logger()
+
+
+class Qwen3_5RMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, gate=None):
+        weight = self.weight
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
 
 
 class GatedDeltaNetConfig(BaseModel):
@@ -150,18 +178,26 @@ class GatedDeltaNet(nn.Module):
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
-        assert causal_conv1d_fn is not None, (
-            "causal_conv1d_fn is not available. Please install causal-conv1d to use GatedDeltaNet by `https://github.com/Dao-AILab/causal-conv1d`."
-        )
+
+        # 先注释掉，因为不存在这个函数
+        # assert causal_conv1d_fn is not None, (
+        #     "causal_conv1d_fn is not available. Please install causal-conv1d to use GatedDeltaNet by `https://github.com/Dao-AILab/causal-conv1d`."
+        # )
         self.causal_conv1d_fn = causal_conv1d_fn
+        
         assert chunk_gated_delta_rule is not None, (
             "chunk_gated_delta_rule is not available. Please install fla to use GatedDeltaNet by `pip install flash-linear-attention`."
         )
         self.chunk_gated_delta_rule = chunk_gated_delta_rule
-        assert FusedRMSNormGated is not None, (
-            "FusedRMSNormGated is not available. Please install fla to use GatedDeltaNet by `pip install flash-linear-attention`."
-        )
-        self.norm = FusedRMSNormGated(self.head_v_dim, eps=self.rms_norm_eps, activation=self.activation)
+        # assert FusedRMSNormGated is not None, (
+        #     "FusedRMSNormGated is not available. Please install fla to use GatedDeltaNet by `pip install flash-linear-attention`."
+        # )
+
+        # 替换FusedRMSNormGated为小算子
+        if FusedRMSNormGated is None:
+            self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.rms_norm_eps)
+        else:
+            self.norm = FusedRMSNormGated(self.head_v_dim, eps=self.rms_norm_eps, activation=self.activation)
 
         self.out_proj = build_linear(
             self.value_dim,
@@ -277,27 +313,72 @@ class GatedDeltaNet(nn.Module):
         query = query.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         key = key.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         value = value.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
-        query = self.causal_conv1d_fn(  # query (batch, dim, seqlen)
-            x=query,  # need non contiguous
-            weight=query_weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
-        key = self.causal_conv1d_fn(
-            x=key,  # need non contiguous
-            weight=key_weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
-        value = self.causal_conv1d_fn(
-            x=value,  # need non contiguous
-            weight=value_weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
+        if self.causal_conv1d_fn is not None:
+            query = self.causal_conv1d_fn(  # query (batch, dim, seqlen)
+                x=query,  # need non contiguous
+                weight=query_weight,
+                bias=bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+            key = self.causal_conv1d_fn(
+                x=key,  # need non contiguous
+                weight=key_weight,
+                bias=bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+            value = self.causal_conv1d_fn(
+                x=value,  # need non contiguous
+                weight=value_weight,
+                bias=bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+        else:
+            # if torch.distributed.get_rank() == 0:
+            #     breakpoint()
+            # torch.distributed.barrier()
+            # query_conv1d = replace_conv1d(query_weight.unsqueeze(1), bias, self.conv1d)
+            # query = F.silu(query_conv1d(query)[:,:,:seq_len*sp_size]) # causal_conv_1d融合算子实际调用
+            # key_conv1d = replace_conv1d(key_weight.unsqueeze(1), bias, self.conv1d)
+            # key = F.silu(key_conv1d(key)[:,:,:seq_len*sp_size]) 
+            # value_conv1d = replace_conv1d(value_weight.unsqueeze(1), bias, self.conv1d)
+            # value = F.silu(value_conv1d(value)[:,:,:seq_len*sp_size])
+            # query = F.silu(F.conv1d(query,query_weight.unsqueeze(1),bias,padding=query_weight.shape[1]-1,
+            #     groups=query_weight.shape[0])[:,:,:seq_len*sp_size])
+            # key = F.silu(F.conv1d(key,key_weight.unsqueeze(1),bias,padding=key_weight.shape[1]-1,
+            #     groups=key_weight.shape[0])[:,:,:seq_len*sp_size])
+            # value = F.silu(F.conv1d(value,value_weight.unsqueeze(1),bias,padding=value_weight.shape[1]-1,
+            #     groups=value_weight.shape[0])[:,:,:seq_len*sp_size])
+            # if torch.distributed.get_rank() == 0:
+            #     breakpoint()
+            # torch.distributed.barrier()
+            if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != query.device:
+                # origin_device = seq_ctx.cu_seq_lens_q.device
+                seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
+            query, _ = causal_conv1d_triton(
+                x=query,
+                weight=query_weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+            key, _ = causal_conv1d_triton(
+                x=key,
+                weight=key_weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+            value, _ = causal_conv1d_triton(
+                x=value,
+                weight=value_weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
@@ -308,6 +389,7 @@ class GatedDeltaNet(nn.Module):
         if isinstance(dt_bias, DTensor):
             dt_bias = dt_bias.to_local()
 
+        A_log = A_log.to(query.device)
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         # (1,key_dim/sp_size, L)
@@ -343,7 +425,12 @@ class GatedDeltaNet(nn.Module):
             )
             g = g.transpose(1, 2)
             beta = beta.transpose(1, 2)
-
+        
+        # if torch.distributed.get_rank()==0:
+        #     breakpoint()
+        # torch.distributed.barrier()
+        # query, key, value, g, beta = varlen_to_nonvarlen(seq_ctx.cu_seq_lens_q, query, key, value, g, beta)
+        
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
             key,
@@ -355,6 +442,9 @@ class GatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q,
         )
+        # if seq_ctx.cu_seq_lens_q is not None:
+        #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
+        # core_attn_out = nonvarlen_to_varlen(seq_ctx.cu_seq_lens_q, core_attn_out)
 
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             core_attn_out = _all_to_all_out(
@@ -418,15 +508,29 @@ class GatedDeltaNet(nn.Module):
 
         # TODO: due to the limitation of scatter_dim=1 in ulysses_all_to_all,
         # the implementation is very inelegant and inefficient, and needs to be refactored in the future.
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        mixed_qkv = self.causal_conv1d_fn(
-            x=mixed_qkv,  # need non contiguous
-            weight=weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        if self.causal_conv1d_fn is not None:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            mixed_qkv = self.causal_conv1d_fn(
+                x=mixed_qkv,  # need non contiguous
+                weight=weight,
+                bias=bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+        else:    
+            # new_conv = replace_conv1d(weight.unsqueeze(1), bias, self.conv1d)
+            # mixed_qkv = F.silu(new_conv(mixed_qkv)[:,:,:seq_len])
+            # mixed_qkv = F.silu(F.conv1d(mixed_qkv,weight.unsqueeze(1),bias,padding=weight.shape[1]-1,groups=weight.shape[0])[:,:,:seq_len])
+            if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != mixed_qkv.device:
+                seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(mixed_qkv.device)
+            mixed_qkv, _ = causal_conv1d_triton(
+                x=mixed_qkv,
+                weight=weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
         query, key, value = torch.split(
             mixed_qkv,
             [
@@ -464,7 +568,7 @@ class GatedDeltaNet(nn.Module):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=seq_ctx.cu_seq_lens_q,
+            cu_seqlens=seq_ctx.cu_seq_lens_q.to('npu'),
         )
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
