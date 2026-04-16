@@ -408,6 +408,8 @@ class TrainingWorker(SingleAcceleratorWorker):
         )
 
         to_free_routed_expert_refs: list[ray.ObjectRef] = []
+        # print(f"====> type of rollout_routed_experts in Trainworker: {type(rollout_routed_experts)}, rollout_routed_experts_value: {rollout_routed_experts}")
+
         if isinstance(rollout_routed_experts, list):
             # list[n,l,e]
             out_rollout_routed_expert = []
@@ -1391,6 +1393,10 @@ class TrainingWorker(SingleAcceleratorWorker):
             optimizer_dir=None if no_save_optimizer else optimizer_path,
         )
 
+        DEVICE_MODULE.empty_cache()
+        import gc
+        gc.collect()
+
         # Save sft dataloader
         if self.rank == 0 and self._sft_dataloader is not None:
             sft_dataloader_path = checkpoint_path / self._SAVE_SFT_DATALOADER_DIR
@@ -1409,6 +1415,10 @@ class TrainingWorker(SingleAcceleratorWorker):
                         }
                     )
                 )
+
+        DEVICE_MODULE.empty_cache()
+        import gc
+        gc.collect()
 
     @ray_method
     def resume(self, load_checkpoint_cfg: LoadCheckpointConfig):
@@ -1456,6 +1466,10 @@ class TrainingWorker(SingleAcceleratorWorker):
                 self._sft_total_consumed_samples = train_state["total_consumed_samples"]
                 self._sft_total_consumed_tokens = train_state["total_consumed_tokens"]
                 self.logger.info(f"Resume sft train state from {train_state_path}")
+        
+        DEVICE_MODULE.empty_cache()
+        import gc
+        gc.collect()
 
     @ray_method
     def ready(self) -> bool:

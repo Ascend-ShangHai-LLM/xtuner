@@ -1361,6 +1361,10 @@ class BaseModel(nn.Module):
             with open(hf_dir / "model.safetensors.index.json", "w") as f:
                 index = {"weight_map": weight_map, "metadata": {}}
                 json.dump(index, f, indent=2, ensure_ascii=False)
+        
+        DEVICE_MODULE.empty_cache()
+        import gc
+        gc.collect()
 
         if dist.is_initialized():
             torch.distributed.barrier()

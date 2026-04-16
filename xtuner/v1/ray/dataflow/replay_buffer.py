@@ -62,6 +62,12 @@ class ReplayMeta:
     version: int = 0  # version for partial rollout
     extra_info: Dict[str, Any] = field(default_factory=dict)
 
+@dataclass
+class SerializedRayObjectRef:
+    """Snapshot marker that preserves where a ray.ObjectRef originally
+    lived."""
+
+    value: Any
 
 def determine_group_state(group_data_items: List[RLDataFlowItem]) -> RolloutState:
     """Determines the processing strategy for a group of rollout samples based
@@ -442,31 +448,82 @@ class ReplayBufferStorage:
         self.sample_from_aborted_count = 0
         self.sample_from_expired_count = 0
 
-    def resolve_ray_objects(self, data_item: RLDataFlowItem):
-        """Resolves ray.ObjectRefs in a RLDataFlowItem to their actual values.
+    def snapshot_ray_objects(self, data_item: RLDataFlowItem):
+        """Replaces nested ray.ObjectRefs with serializable markers."""
+        self._snapshot_nested_objectrefs(data_item)
 
-        Args:
-            data_item (RLDataFlowItem): The data item containing ray.ObjectRefs.
-        Returns:
-            RLDataFlowItem: The data item with ray.ObjectRefs resolved.
-        """
+    def restore_ray_objects(self, data_item: RLDataFlowItem):
+        """Restores nested ray.ObjectRefs from serialized snapshot markers."""
+        self._restore_nested_objectrefs(data_item)
 
-        # Resolve data.multimodal_train_info
-        if hasattr(data_item.data, "multimodal_train_info"):
-            multimodal_info = data_item.data.multimodal_train_info
-            if multimodal_info and "pixel_values" in multimodal_info:
-                pixel_values_ref = multimodal_info["pixel_values"]
-                if isinstance(pixel_values_ref, ObjectRef):
-                    multimodal_info["pixel_values"] = ray.get(pixel_values_ref)
-                    data_item.data.multimodal_train_info = multimodal_info
-        # Resolve rollout.extra_info.router_experts
-        if "routed_experts" in data_item.env.rollout.extra_info:
-            if isinstance(data_item.env.rollout.extra_info["routed_experts"], ObjectRef):
-                routed_experts = ray.get(data_item.env.rollout.extra_info["routed_experts"])
-                ray.internal.free(data_item.env.rollout.extra_info["routed_experts"], local_only=False)
-                del data_item.env.rollout.extra_info["routed_experts"]
-                data_item.env.rollout.extra_info["routed_experts"] = routed_experts
-                self.logger.info("Resolved routed_experts ObjectRef in rollout.extra_info")
+    def _snapshot_nested_objectrefs(self, obj: Any):
+        if isinstance(obj, ObjectRef):
+            value = ray.get(obj)
+            return SerializedRayObjectRef(self._snapshot_nested_objectrefs(value))
+        if isinstance(obj, BaseModel):
+            for field_name in type(obj).model_fields:
+                setattr(obj, field_name, self._snapshot_nested_objectrefs(getattr(obj, field_name)))
+            return obj
+        if isinstance(obj, list):
+            for idx, value in enumerate(obj):
+                obj[idx] = self._snapshot_nested_objectrefs(value)
+            return obj
+        if isinstance(obj, tuple):
+            return tuple(self._snapshot_nested_objectrefs(value) for value in obj)
+        if isinstance(obj, set):
+            return {self._snapshot_nested_objectrefs(value) for value in obj}
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                obj[key] = self._snapshot_nested_objectrefs(value)
+            return obj
+        return obj
+
+    def _restore_nested_objectrefs(self, obj: Any):
+        if isinstance(obj, SerializedRayObjectRef):
+            return ray.put(self._restore_nested_objectrefs(obj.value))
+        if isinstance(obj, BaseModel):
+            for field_name in type(obj).model_fields:
+                setattr(obj, field_name, self._restore_nested_objectrefs(getattr(obj, field_name)))
+            return obj
+        if isinstance(obj, list):
+            for idx, value in enumerate(obj):
+                obj[idx] = self._restore_nested_objectrefs(value)
+            return obj
+        if isinstance(obj, tuple):
+            return tuple(self._restore_nested_objectrefs(value) for value in obj)
+        if isinstance(obj, set):
+            return {self._restore_nested_objectrefs(value) for value in obj}
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                obj[key] = self._restore_nested_objectrefs(value)
+            return obj
+        return obj
+
+    # def resolve_ray_objects(self, data_item: RLDataFlowItem):
+    #     """Resolves ray.ObjectRefs in a RLDataFlowItem to their actual values.
+
+    #     Args:
+    #         data_item (RLDataFlowItem): The data item containing ray.ObjectRefs.
+    #     Returns:
+    #         RLDataFlowItem: The data item with ray.ObjectRefs resolved.
+    #     """
+
+    #     # Resolve data.multimodal_train_info
+    #     if hasattr(data_item.data, "multimodal_train_info"):
+    #         multimodal_info = data_item.data.multimodal_train_info
+    #         if multimodal_info and "pixel_values" in multimodal_info:
+    #             pixel_values_ref = multimodal_info["pixel_values"]
+    #             if isinstance(pixel_values_ref, ObjectRef):
+    #                 multimodal_info["pixel_values"] = ray.get(pixel_values_ref)
+    #                 data_item.data.multimodal_train_info = multimodal_info
+    #     # Resolve rollout.extra_info.router_experts
+    #     if "routed_experts" in data_item.env.rollout.extra_info:
+    #         if isinstance(data_item.env.rollout.extra_info["routed_experts"], ObjectRef):
+    #             routed_experts = ray.get(data_item.env.rollout.extra_info["routed_experts"])
+    #             ray.internal.free(data_item.env.rollout.extra_info["routed_experts"], local_only=False)
+    #             del data_item.env.rollout.extra_info["routed_experts"]
+    #             data_item.env.rollout.extra_info["routed_experts"] = routed_experts
+    #             self.logger.info("Resolved routed_experts ObjectRef in rollout.extra_info")
 
     def convert_to_ray_objref(self, data_item: RLDataFlowItem):
         """Converts large tensors in RLDataFlowItem to ray.ObjectRefs.
@@ -495,6 +552,8 @@ class ReplayBufferStorage:
         def check(obj):
             if isinstance(obj, ray.ObjectRef):
                 return True
+            if isinstance(obj, SerializedRayObjectRef):
+                return check(obj.value)
             if isinstance(obj, BaseModel):
                 return any(check(getattr(obj, f)) for f in obj.model_fields)
             if isinstance(obj, (list, tuple, set)):
@@ -506,7 +565,7 @@ class ReplayBufferStorage:
             # 如果不满足以上类型，抛出错误，防止意想不到的问题
             raise TypeError(
                 f"Unsupported type: {type(obj)} in {obj} "
-                f"Expected ray.ObjectRef, BaseModel, list/tuple/set, dict, or primitive types."
+                f"Expected ray.ObjectRef, SerializedRayObjectRef, BaseModel, list/tuple/set, dict, or primitive types."
             )
 
         return check(item)
@@ -523,7 +582,7 @@ class ReplayBufferStorage:
 
         for data_items in all_data_items:
             for item in data_items:
-                self.resolve_ray_objects(item)
+                self.snapshot_ray_objects(item)
                 res = self.has_objectref(item)
                 assert not res, "ReplayBufferStorage.dump found unresolved ray.ObjectRef in RLDataFlowItem"
 
@@ -565,7 +624,7 @@ class ReplayBufferStorage:
         # 重建 _actions 和 _observations: 与replaymeta相关
         for group_dataitem in dump_actions:
             for data_item in group_dataitem:
-                self.convert_to_ray_objref(data_item)
+                self.restore_ray_objects(data_item)
             replay_meta = mapping_dataitem_to_replaymeta(group_dataitem)
             action_id = replay_meta.action_id
             self._actions[action_id] = replay_meta

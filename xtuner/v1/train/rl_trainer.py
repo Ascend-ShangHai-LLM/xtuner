@@ -797,6 +797,7 @@ class RLTrainer:
 
                 if "routed_experts" in group[i].env.rollout.extra_info:
                     routed_experts = group[i].env.rollout.extra_info.pop("routed_experts")  # n,layer*expert
+                    # print(f"====type of routed_experts in rl_trainer: {type(ray.get(routed_experts))}")
                     seq_ctx.rollout_routed_experts = routed_experts  # n,layer,expert
 
                 data_batches.append(data_dict)

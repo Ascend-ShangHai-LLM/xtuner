@@ -90,7 +90,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.server_task = None
         self.engine_bundle_idxs: list[int] = []
         self.server_process: Optional[multiprocessing.Process] = None
-        self.logger = get_logger(log_dir=config.worker_log_dir, tag="RolloutWorker")
+        self.logger = get_logger(level='INFO', log_dir=config.worker_log_dir, tag="RolloutWorker")
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_path, trust_remote_code=True)
         self.check_flag = True  # only print once
         self.enable_return_routed_experts = self.config.enable_return_routed_experts
@@ -559,7 +559,6 @@ class RolloutWorker(SingleAcceleratorWorker):
                     last_token_ids = response["output_ids"][-num_return_tokens:] if num_return_tokens > 0 else []
 
                 if self.enable_return_routed_experts and not extra_params.get("disable_routed_experts", False):
-                    # self.logger.info(f"response[meta_info][routed_experts]: {response['meta_info'].get('routed_experts', None)}, input_extra_info[routed_experts]: {input_extra_info.get('routed_experts', None)}")
                     assert "routed_experts" in response["meta_info"], (
                         "enable_return_routed_experts is True, but routed_experts is not in meta_info"
                     )
@@ -574,6 +573,7 @@ class RolloutWorker(SingleAcceleratorWorker):
 
                             data = base64.b64decode(routed_experts)
                             routed_experts = ray.cloudpickle.loads(data)
+                            del data
                         else:
                             routed_experts = torch.tensor(routed_experts)  # n,layer,expert
                             routed_experts = ray.put(routed_experts)
@@ -587,13 +587,21 @@ class RolloutWorker(SingleAcceleratorWorker):
                             routed_experts = ray.cloudpickle.loads(data)
                             cur_routed_experts = await routed_experts  # n,layer,expert
                             ray.internal.free(routed_experts, local_only=False)
+                            del data
                         else:
                             routed_experts = torch.tensor(routed_experts)  # n,layer,expert
                             cur_routed_experts = routed_experts
 
                         history_routed_experts = await input_extra_info["routed_experts"]  # n, layer, expert
+                        # self.logger.info(f"history_routed_experts: {history_routed_experts}")
                         ray.internal.free(input_extra_info["routed_experts"], local_only=False)
-                        del input_extra_info["routed_experts"]
+                        # del input_extra_info["routed_experts"]
+                        del input_extra_info
+                        # self.logger.info(f"history_routed_experts after del: {history_routed_experts}")
+                        # if isinstance(history_routed_experts, np.ndarray):
+                        #     np.save(f"/mnt/huawei/rl_qwen35/code/history_routed_experts_{uid}.npy", history_routed_experts)
+                        # elif isinstance(history_routed_experts, torch.Tensor):
+                        #     torch.save(history_routed_experts.cpu(), f"/mnt/huawei/rl_qwen35/code/history_routed_experts_{uid}.pt")
 
                         assert (history_routed_experts.shape[0] - 1) > 0 and history_routed_experts.shape[
                             0
@@ -601,6 +609,15 @@ class RolloutWorker(SingleAcceleratorWorker):
                             f"Existing routed_experts shape: {history_routed_experts.shape}, current routed_experts shape: {cur_routed_experts.shape}"
                         )
                         init_cur_roued_experts = cur_routed_experts.shape[0]
+
+# ========================================== DFX =============================================== #
+                        # prompt_tokens = response["meta_info"].get("prompt_tokens", 0)
+                        # response_tokens = response["meta_info"].get("completion_tokens", 0)                        
+                        # self.logger.info(
+                        #     f"[{root_id}/{action_id}] prompt_tokens: {prompt_tokens}, response_tokens: {response_tokens}"
+                        #     f"[{root_id}/{action_id}] Received routed_experts BEFORE CONCATE with shape {cur_routed_experts.shape} and history routed_experts with shape {history_routed_experts.shape}. The first layer/first token expert id in current routed_experts is {cur_routed_experts[prompt_tokens:prompt_tokens + 10, 0, 0]} and in history routed_experts is {history_routed_experts[prompt_tokens:prompt_tokens + 10, 0, 0]}"
+                        # )
+# ========================================== DFX =============================================== #
                         cur_routed_experts = cur_routed_experts[history_routed_experts.shape[0] :, :, :]
                         concat_routed_experts = np.concatenate((history_routed_experts, cur_routed_experts), axis=0)
                         prompt_tokens = response["meta_info"].get("prompt_tokens", 0)
@@ -614,6 +631,9 @@ class RolloutWorker(SingleAcceleratorWorker):
                             f"Experts(exist={history_routed_experts.shape}, init_cur={init_cur_roued_experts}, cur={cur_routed_experts.shape}, concat={concat_routed_experts.shape})"
                         )
                         extra_info["routed_experts"] = ray.put(concat_routed_experts)
+                        del history_routed_experts
+                        del cur_routed_experts
+                        # print(f"====type of concat_routed_experts: {type(concat_routed_experts)}")
                     else:
                         assert finish_reason == "abort", (
                             f"routed_experts is None, but finish_reason is {finish_reason}, expected abort. response: {response}"

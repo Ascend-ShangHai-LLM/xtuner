@@ -126,6 +126,7 @@ class RawSingleTurnEnvironment(BaseEnvironment):
                     extra_params=extra_params,
                     extra_info=rollout_extra_info,
                 )
+                del rollout_extra_info
                 response_future.append(fut)
             try:
                 rollout_responses = await asyncio.wait_for(
