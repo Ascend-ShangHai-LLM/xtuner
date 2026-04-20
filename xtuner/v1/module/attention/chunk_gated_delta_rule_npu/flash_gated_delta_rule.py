@@ -233,9 +233,6 @@ def flash_chunk_gated_delta_rule_bwd(
         chunk_size=chunk_size
     )
     dh0 = None
-    # if torch.distributed.get_rank()==0:
-    #     breakpoint()
-    # torch.distributed.barrier()
 
     dq, dk, dw, dg = torch_npu.npu_chunk_bwd_dqkwg(
         q, 
@@ -366,9 +363,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
-        # if torch.distributed.get_rank()==0:
-        #     breakpoint()
-        # torch.distributed.barrier()
         return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None, None
 
 
