@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import prepare_chunk_indices, make_tensor_descriptor, input_guard, is_amd
+from .utils import make_tensor_descriptor, input_guard
 
 
 FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'ieee')
@@ -227,6 +227,7 @@ def solve_tril_64x64_kernel(
 def solve_tril(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.float
 ) -> torch.Tensor:
     """
@@ -252,7 +253,6 @@ def solve_tril(
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)

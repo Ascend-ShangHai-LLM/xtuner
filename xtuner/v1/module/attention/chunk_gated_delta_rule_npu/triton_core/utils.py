@@ -78,6 +78,30 @@ def prepare_chunk_indices(
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
 
 
+@tensor_cache
+def prepare_chunk_indices_list( 
+    cu_seqlens: list[int],
+    chunk_size: int
+ ) -> list[int]: 
+    indices = []
+    
+    for i in range(len(cu_seqlens) - 1):
+        start = cu_seqlens[i]
+        end = cu_seqlens[i+1]
+        length = end - start
+        
+        if length <= 0:
+            continue
+            
+        num_chunks = (length + chunk_size - 1) // chunk_size
+        
+        for chunk_id in range(num_chunks):
+            indices.append((i))
+            indices.append((chunk_id))
+            
+    return indices
+
+
 def get_abs_err(x, y):
     return (x.detach() - y.detach()).flatten().abs().max().item()
 

@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import prepare_chunk_indices
 
 
 @triton.heuristics({
@@ -255,6 +254,7 @@ def chunk_scaled_dot_kkt_fwd(
     gk: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
@@ -263,7 +263,7 @@ def chunk_scaled_dot_kkt_fwd(
 
     Args:
         k (torch.Tensor):
-            The key tensor of shape `[B, T, H, K]`.
+            The key tensor of shape `[B, H, T, K]`.
         beta (torch.Tensor):
             The beta tensor of shape `[B, T, H]`.
         g (torch.Tensor):
@@ -281,9 +281,8 @@ def chunk_scaled_dot_kkt_fwd(
     Returns:
         beta * K * K^T of shape `[B, T, H, BT]` where `BT` is the chunk size.
     """
-    B, T, H, K = k.shape
+    B, H, T, K = k.shape
     BT = chunk_size
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     beta = beta.transpose(1, 2).contiguous()
     g = g.transpose(1, 2).contiguous()

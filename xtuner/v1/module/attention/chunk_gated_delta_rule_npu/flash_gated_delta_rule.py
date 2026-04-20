@@ -3,7 +3,7 @@
 # Copyright (c) 2025, HUAWEI CORPORATION.  All rights reserved.
 
 import warnings
-from typing import Optional
+from typing import Optional, Dict
 import math
 
 import torch
@@ -18,7 +18,7 @@ import torch_npu
 
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from .triton_core.wy_fast import recompute_w_u_fwd
+
 from .triton_core.solve_tril import solve_tril
 from .triton_core.cumsum import chunk_local_cumsum
 from .triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -36,29 +36,6 @@ def prepare_chunk_indices(
     indices = torch.cat([torch.arange(n) for n in cdiv_torch(prepare_lens(cu_seqlens), chunk_size).tolist()])
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
 
-
-def prepare_chunk_indices1( 
-    cu_seqlens: list[int],
-    chunk_size: int
- ) -> list[int]: 
-    indices = []
-    
-    for i in range(len(cu_seqlens) - 1):
-        start = cu_seqlens[i]
-        end = cu_seqlens[i+1]
-        length = end - start
-        
-        if length <= 0:
-            continue
-            
-        num_chunks = (length + chunk_size - 1) // chunk_size
-        
-        for chunk_id in range(num_chunks):
-            indices.append((i))
-            indices.append((chunk_id))
-            
-    return indices
-
 def flash_chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -69,51 +46,45 @@ def flash_chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens_list: Optional[list[int]] = None,
+    chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
+    chunk_indices_list: Dict[str, Optional[list[int]]] = None,
     chunk_size: int = 64,
 ):
 
-    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
-
+    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, head_first=False)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
         g=g,
         beta=beta,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices[str(chunk_size)],
         chunk_size=chunk_size,
         output_dtype=torch.float32
     )
+
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
+        chunk_indices_out=chunk_indices,
         output_dtype=k.dtype
     )
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
+    g = g.transpose(1, 2).contiguous()
+    beta = beta.transpose(1, 2).contiguous().float()
+    A = A.transpose(1, 2).contiguous()
+    w, u = torch_npu.npu_recompute_w_u_fwd(
+        k,
+        v,
+        beta,
+        A,
+        g,
+        None,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=chunk_indices_list[str(chunk_size)],
+        chunk_size=chunk_size,
     )
 
-    if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    else:
-        chunk_indices = None
-
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
-    w = w.transpose(1, 2).contiguous()
-    u = u.transpose(1, 2).contiguous()
-    g = g.transpose(1, 2).contiguous()
-
-    import torch.distributed as dist
-
-    # if not dist.is_initialized() or dist.get_rank() == 0:
-    #     breakpoint()  # 或使用 pdb.set_trace()
-    # print(cu_seqlens.dtype)
-    # print(chunk_indices.dtype)
     h, v_new, final_state = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
         k,
         w,
@@ -121,13 +92,11 @@ def flash_chunk_gated_delta_rule_fwd(
         g,
         initial_state,
         cu_seqlens,
-        chunk_indices,
+        chunk_indices[str(chunk_size)],
         output_final_state,
         chunk_size
     )
 
-    if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     o = torch_npu.npu_chunk_fwd_o(
         q,
@@ -136,7 +105,7 @@ def flash_chunk_gated_delta_rule_fwd(
         h,
         g,
         cu_seqlens,
-        chunk_indices,
+        chunk_indices[str(chunk_size)],
         scale,
         chunk_size
     )
@@ -157,31 +126,27 @@ def flash_chunk_gated_delta_rule_bwd(
     do: torch.Tensor,
     dht: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens_list: Optional[list[int]] = None,
+    chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
+    chunk_indices_list: Dict[str, Optional[list[int]]] = None,
     chunk_size: int = 64,
 ):
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
-    )
-    
-    if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    else:
-        chunk_indices = None
-
-    w = w.transpose(1, 2).contiguous()
-    v = v.transpose(1, 2).contiguous()
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
-    do = do.transpose(1, 2).contiguous()
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
-    u = u.transpose(1, 2).contiguous()
-    A = A.transpose(1, 2).contiguous()
+    w, u = torch_npu.npu_recompute_w_u_fwd(
+        k,
+        v,
+        beta,
+        A,
+        g,
+        None,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=chunk_indices_list[str(chunk_size)],
+        chunk_size=chunk_size,
+    )
+
+
+    do = do.transpose(1, 2).contiguous()
     
     h, v_new, _ = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
         k,
@@ -190,16 +155,11 @@ def flash_chunk_gated_delta_rule_bwd(
         g,
         initial_state,
         cu_seqlens,
-        chunk_indices,
+        chunk_indices[str(chunk_size)],
         False,
         chunk_size
     )
     
-    if cu_seqlens is not None:
-        cu_seqlens1 = cu_seqlens.tolist()
-        chunk_indices = prepare_chunk_indices1(cu_seqlens1, chunk_size)
-    else:
-        cu_seqlens1 = None
 
     dv = torch_npu.npu_chunk_bwd_dv_local(
       q, 
@@ -208,15 +168,12 @@ def flash_chunk_gated_delta_rule_bwd(
       g, 
       g_gamma=None, 
       A=A,
-      cu_seqlens=cu_seqlens1, 
-      chunk_indices=chunk_indices, 
+      cu_seqlens=cu_seqlens_list, 
+      chunk_indices=chunk_indices_list[str(chunk_size)], 
       scale=scale, 
       chunk_size=chunk_size
     )
     
-    # 对齐？
-    # if not dist.is_initialized() or dist.get_rank() == 0:
-    # breakpoint()  # 或使用 pdb.set_trace()
     dh, dh0, dv = torch_npu.npu_chunk_gated_delta_rule_bwd_dhu(
         q,
         k,
@@ -227,8 +184,8 @@ def flash_chunk_gated_delta_rule_bwd(
         gK=None,
         h0=None,
         dht=None,
-        cu_seqlens=cu_seqlens1,
-        chunk_indices=chunk_indices,
+        cu_seqlens=cu_seqlens_list, 
+        chunk_indices=chunk_indices_list[str(chunk_size)], 
         scale=scale,
         chunk_size=chunk_size
     )
@@ -243,8 +200,8 @@ def flash_chunk_gated_delta_rule_bwd(
         do, 
         dh, 
         dv, 
-        cu_seqlens1, 
-        chunk_indices, 
+        cu_seqlens_list, 
+        chunk_indices_list[str(chunk_size)],  
         scale, 
         chunk_size
     )
@@ -252,13 +209,13 @@ def flash_chunk_gated_delta_rule_bwd(
     dA = torch_npu.npu_prepare_wy_repr_bwd_da(
         k, 
         v, 
-        beta, 
+        beta.float(), 
         A, 
         dw, 
         dv, 
-        g, 
-        cu_seqlens=cu_seqlens1,
-        chunk_indices=chunk_indices,
+        g.float(), 
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=chunk_indices_list[str(chunk_size)], 
         chunk_size=chunk_size
     )
 
@@ -271,17 +228,13 @@ def flash_chunk_gated_delta_rule_bwd(
         dw,
         dv,
         g,
-        cu_seqlens=cu_seqlens1,
-        chunk_indices=chunk_indices,
+        cu_seqlens=cu_seqlens_list,
+        chunk_indices=chunk_indices_list[str(chunk_size)], 
         chunk_size=chunk_size
     )
     
-    dv = dv.transpose(1, 2).contiguous()
-    dk2 = dk2.transpose(1, 2).contiguous()
     db = db.transpose(1, 2).contiguous()
     dg2 = dg2.transpose(1, 2).contiguous()
-    dq = dq.transpose(1, 2).contiguous()
-    dk = dk.transpose(1, 2).contiguous()
     dg = dg.transpose(1, 2).contiguous()
 
     dk.add_(dk2)
@@ -291,7 +244,7 @@ def flash_chunk_gated_delta_rule_bwd(
             f"dg current type is {dg.dtype} , should be float32"
         )
     
-    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens, head_first=False)
+    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens, chunk_indices_out=chunk_indices, head_first=False)
         
     return dq, dk, dv, db, dg, dh0
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -310,6 +263,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state: torch.Tensor,
         output_final_state: bool,
         cu_seqlens: Optional[torch.LongTensor] = None,
+        cu_seqlens_list: Optional[list[int]] = None,
+        chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
+        chunk_indices_list: Dict[str, Optional[list[int]]] = None,
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
     ):
@@ -329,12 +285,19 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices=chunk_indices,
+            chunk_indices_list=chunk_indices_list,
             chunk_size=chunk_size
         )
         ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens)
+        ctx.cu_seqlens_list = cu_seqlens_list
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.chunk_size = chunk_size
+        ctx.cu_seqlens_list = cu_seqlens_list
+        ctx.chunk_indices = chunk_indices
+        ctx.chunk_indices_list = chunk_indices_list
         return o.to(q.dtype), final_state
 
     @staticmethod
@@ -346,6 +309,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         dht: torch.Tensor
     ):
         q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
+        chunk_indices = ctx.chunk_indices
+        cu_seqlens_list = ctx.cu_seqlens_list
+        chunk_indices_list = ctx.chunk_indices_list
         dq, dk, dv, db, dg, dh0 = flash_chunk_gated_delta_rule_bwd(
             q=q,
             k=k,
@@ -358,12 +324,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             do=do,
             dht=dht,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices=chunk_indices,
+            chunk_indices_list=chunk_indices_list,
             chunk_size=ctx.chunk_size,
         )
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
-        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None, None
+        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None, None, None, None, None
 
 
 @torch.compiler.disable
@@ -378,6 +347,9 @@ def flash_gated_delta_rule(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens_list: Optional[list[int]] = None,
+    chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
+    chunk_indices_list: Dict[str, Optional[list[int]]] = None,
     chunk_size: int = 64,
     head_first: bool = False,
 ):
@@ -495,7 +467,10 @@ def flash_gated_delta_rule(
         initial_state,
         output_final_state,
         cu_seqlens,
+        cu_seqlens_list,
+        chunk_indices,
+        chunk_indices_list,
         use_qk_l2norm_in_kernel,
-        chunk_size
+        chunk_size,
     )
     return o, final_state

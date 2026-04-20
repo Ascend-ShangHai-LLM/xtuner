@@ -62,6 +62,7 @@ from xtuner.v1.utils import (
     get_logger,
 )
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
+from xtuner.v1.module.attention.chunk_gated_delta_rule_npu.triton_core.utils import prepare_chunk_indices_list, prepare_chunk_indices
 
 
 if TYPE_CHECKING:
@@ -91,6 +92,41 @@ MOE_NON_EP_COMPILE_CFG: dict[str, TorchCompileOption] = {
 MOE_EP_COMPILE_CFG = MOE_NON_EP_COMPILE_CFG.copy()
 MOE_EP_COMPILE_CFG.pop("xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer.forward")
 
+def cdiv_torch(a, b):
+    return (a + b - 1) // b
+
+def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+    return cu_seqlens[1:] - cu_seqlens[:-1]
+
+def prepare_chunk_indices(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int
+) -> torch.LongTensor:
+    indices = torch.cat([torch.arange(n) for n in cdiv_torch(prepare_lens(cu_seqlens), chunk_size).tolist()])
+    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+
+
+def prepare_chunk_indices1( 
+    cu_seqlens: list[int],
+    chunk_size: int
+ ) -> list[int]: 
+    indices = []
+    
+    for i in range(len(cu_seqlens) - 1):
+        start = cu_seqlens[i]
+        end = cu_seqlens[i+1]
+        length = end - start
+        
+        if length <= 0:
+            continue
+            
+        num_chunks = (length + chunk_size - 1) // chunk_size
+        
+        for chunk_id in range(num_chunks):
+            indices.append((i))
+            indices.append((chunk_id))
+            
+    return indices
 
 class MoEModelOutputs(ModelOutputs):
     router_logits: dict[str, torch.Tensor] | None = None
@@ -601,6 +637,24 @@ class MoE(BaseModel):
 
         return MoEModelOutputs(**output, logits=logits)
 
+    def prepare_chunk_indices_all(self, seq_ctx: SequenceContext):
+        from concurrent.futures import ThreadPoolExecutor
+        cu_seq_lens_int64 = seq_ctx.cu_seq_lens_q.to(torch.int64).to(seq_ctx.inputs_embeds.device)
+        seq_ctx.cu_seq_lens_q = cu_seq_lens_int64
+        seq_ctx.cu_seq_lens_list = cu_seq_lens_int64.tolist()  # for compatibility with prepare_chunk_indices1
+        CHUNK_SIZES = [16, 32, 64, 128, 608 * 2]
+
+        def compute_chunk_indices(chunk_size):
+            return str(chunk_size), prepare_chunk_indices(cu_seq_lens_int64, chunk_size=chunk_size)
+    
+        with ThreadPoolExecutor() as executor:
+            chunk_indices = dict(executor.map(compute_chunk_indices, CHUNK_SIZES))
+                
+        cur_chunk_size = 64
+        chunk_indices_list = {str(cur_chunk_size): prepare_chunk_indices_list(cu_seq_lens_int64, chunk_size=cur_chunk_size)}
+        seq_ctx.chunk_indices = chunk_indices
+        seq_ctx.chunk_indices_list = chunk_indices_list
+
     def _forward(
         self,
         seq_ctx: SequenceContext,  # todo(@yehaochen): support intra layer micro-batch
@@ -609,7 +663,13 @@ class MoE(BaseModel):
     ) -> MoEModelOutputs:
         input_ids = seq_ctx.input_ids
         position_ids = seq_ctx.position_ids
+        
+        cu_seq_lens_int64 = seq_ctx.cu_seq_lens_q.to(torch.int64).npu()
+        seq_ctx.cu_seq_lens_list = cu_seq_lens_int64.tolist()  # for compatibility with prepare_chunk_indices1
+        seq_ctx.chunk_indices = prepare_chunk_indices(cu_seq_lens_int64, chunk_size = 64)
+        seq_ctx.chunk_indices1 = prepare_chunk_indices1(cu_seq_lens_int64, chunk_size = 64)
 
+        self.prepare_chunk_indices_all(seq_ctx)
         if input_ids is not None:
             hidden_states = self.embed_tokens(input_ids)
         else:
