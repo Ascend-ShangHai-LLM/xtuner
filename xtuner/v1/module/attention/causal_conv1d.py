@@ -15,6 +15,7 @@ class CausalConv1dFunction(torch.autograd.Function):
         ctx,
         x: torch.Tensor,
         weight: torch.Tensor,
+        H: int,
         bias: Optional[torch.Tensor] = None,
         residual: Optional[torch.Tensor] = None,
         initial_state: Optional[torch.Tensor] = None,
@@ -27,11 +28,13 @@ class CausalConv1dFunction(torch.autograd.Function):
         ctx.save_for_backward(x, weight, bias, residual, initial_state)
         ctx.activation = activation
         ctx.cu_seqlens = cu_seqlens
+        ctx.H = H
         
         # Call the forward implementation
         y, final_state = causal_conv1d_fwd_impl(
             x=x,
             weight=weight,
+            H=H,
             bias=bias,
             residual=residual,
             initial_state=initial_state,
@@ -49,11 +52,13 @@ class CausalConv1dFunction(torch.autograd.Function):
         x, weight, bias, residual, initial_state = ctx.saved_tensors
         activation = ctx.activation
         cu_seqlens = ctx.cu_seqlens
+        H = ctx.H
 
         # Call the backward implementation with dht (could be None)
         dx, dw, db, dr, dh0 = causal_conv1d_bwd_impl(
             x=x,
             dy=dy,
+            H=H,
             dht=dht,
             weight=weight,
             bias=bias,
@@ -65,12 +70,13 @@ class CausalConv1dFunction(torch.autograd.Function):
 
         # Return gradients in the order of forward inputs
         # Note: We don't return gradients for non-tensor inputs (activation, cu_seqlens, output_final_state)
-        return dx, dw.transpose(0, 1).contiguous(), db, dr, dh0, None, None, None
+        return dx, dw.transpose(0, 1).contiguous(), None, db, dr, dh0, None, None, None
 
 
 def causal_conv1d_triton(
     x: torch.Tensor,
     weight: torch.Tensor,
+    H: int,
     bias: Optional[torch.Tensor] = None,
     residual: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
@@ -96,5 +102,5 @@ def causal_conv1d_triton(
         final_state: Optional final state tensor if output_final_state is True
     """
     return CausalConv1dFunction.apply(
-        x, weight, bias, residual, initial_state, activation, cu_seqlens, output_final_state
+        x, weight, H, bias, residual, initial_state, activation, cu_seqlens, output_final_state
     )
