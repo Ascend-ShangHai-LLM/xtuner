@@ -36,7 +36,7 @@ def native_zero_centered_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon
 
 def zero_centered_rms_norm_npu(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
     import torch_npu
-    output = torch_npu.npu_rms_norm(x.float(), 1.0 + weight.float(), epsilon)[0]
+    output = torch_npu.npu_rms_norm(x, 1.0 + weight.float(), epsilon)[0]
     return output.type_as(x)
 
 
