@@ -12,6 +12,7 @@ import torch_npu
 import triton
 import triton.language as tl
 from typing import Optional
+from torch.autograd import Function
 
 import triton.runtime.driver as driver
 device = torch_npu.npu.current_device()
@@ -137,10 +138,102 @@ def fused_ce_loss_kernel_chunked(
     tl.store(out_ptr + i, loss)
 
 
-# ============================================================================
-# PyTorch 包装接口
-# ============================================================================
+# ============================================================================# PyTorch 包装接口 (支持自动微分)# ============================================================================
+class FusedCrossEntropyLoss(Function):
+    """
+    融合交叉熵损失的自定义自动微分函数
+    使用 Triton 内核实现前向和反向传播
+    """
+    
+    @staticmethod
+    def forward(ctx, logits, weight, labels, ignore_index=-100, vocab_chunk_size=4096):
+        """
+        前向传播
+        
+        Args:
+            logits: [N, C] - logits 张量
+            labels: [N] - 标签张量
+            weight: [N] - 权重张量
+            ignore_index: int - 忽略的标签索引
+            vocab_chunk_size: int - 分块大小 (仅大词汇表使用)
+            
+        Returns:
+            loss: scalar - 总损失
+        """
+        N, C = logits.shape
+        assert labels.shape == (N,)
+        assert weight.shape == (N,)
+        
+        # 保存需要反向传播的张量和参数
+        ctx.save_for_backward(logits, weight, labels)
+        ctx.ignore_index = ignore_index
+        ctx.vocab_chunk_size = vocab_chunk_size
+        
+        # 分配输出张量
+        out = torch.empty(N, dtype=torch.float32, device=logits.device)
+        
+        # 大词汇表: 使用分块版本
+        # 确保 vocab_chunk_size 是 2 的幂
+        VOCAB_CHUNK_SIZE = triton.next_power_of_2(vocab_chunk_size)
+        grid = (N,)
+        
+        # 调用 Triton 内核
+        fused_ce_loss_kernel_chunked[grid](
+            logits,
+            weight,
+            labels,
+            out,
+            N=N,
+            C=C,
+            VOCAB_CHUNK_SIZE=VOCAB_CHUNK_SIZE,
+            ignore_index=ignore_index,
+        )
+        
+        # 返回总损失
+        return out.sum()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        反向传播
+        
+        Args:
+            grad_output: scalar - 上游梯度
+            
+        Returns:
+            grad_logits: [N, C] - logits 的梯度
+            grad_weight: [N] - weight 的梯度
+            None: labels 没有梯度
+            None: ignore_index 没有梯度
+            None: vocab_chunk_size 没有梯度
+        """
+        # 取出保存的张量
+        logits, weight, labels = ctx.saved_tensors
+        ignore_index = ctx.ignore_index
+        
+        # 初始化输出梯度
+        grad_logits = torch.empty_like(logits, dtype=torch.bfloat16)
+        grad_weight = torch.empty_like(weight, dtype=torch.bfloat16)
+        
+        # 形状
+        N, V = logits.shape
+        
+        # 启动 Triton 内核
+        BLOCK_V = min(4096, V)
+        grid = (N,)
+        
+        chunk_loss_bw_kernel[grid](
+            logits, labels, weight, grad_output,
+            grad_logits, grad_weight,
+            N, V, ignore_index,
+            BLOCK_V=BLOCK_V
+        )
+        
+        # 返回梯度
+        return grad_logits, grad_weight, None, None, None
 
+
+# 包装函数，方便使用
 def fused_cross_entropy_loss(
     logits,
     weight,
@@ -149,42 +242,19 @@ def fused_cross_entropy_loss(
     vocab_chunk_size=4096
 ):
     """
-    融合交叉熵损失 (自动选择最优实现)
-
+    融合交叉熵损失 (自动选择最优实现，支持自动微分)
+    
     Args:
         logits: [N, C] - logits 张量
         labels: [N] - 标签张量
         weight: [N] - 权重张量
         ignore_index: int - 忽略的标签索引
         vocab_chunk_size: int - 分块大小 (仅大词汇表使用)
-
+        
     Returns:
         loss: scalar - 总损失
     """
-    N, C = logits.shape
-    assert labels.shape == (N,)
-    assert weight.shape == (N,)
-
-    out = torch.empty(N, dtype=torch.float32, device=logits.device)
-
-
-    # 大词汇表: 使用分块版本
-    # 确保 vocab_chunk_size 是 2 的幂
-    VOCAB_CHUNK_SIZE = triton.next_power_of_2(vocab_chunk_size)
-    grid = (N,)
-
-    fused_ce_loss_kernel_chunked[grid](
-        logits,
-        weight,
-        labels,
-        out,
-        N=N,
-        C=C,
-        VOCAB_CHUNK_SIZE=VOCAB_CHUNK_SIZE,
-        ignore_index=ignore_index,
-    )
-
-    return out.sum()
+    return FusedCrossEntropyLoss.apply(logits, weight, labels, ignore_index, vocab_chunk_size)
 
 
 
@@ -337,55 +407,3 @@ class ChunkLoss(Function):
         # ====================== 返回顺序：logits, loss_weight, shifted_labels ======================
         return grad_logits, grad_loss_weight, None
 
-# ---------------------------
-# 测试：和 PyTorch 结果完全对齐
-# ---------------------------
-if __name__ == "__main__":
-    import torch.nn.functional as F
-
-    # 构造数据
-    bs, seq_len, vocab_size = 1, 1024, 248320
-    logits = torch.randn(bs * seq_len, vocab_size, device="npu", dtype=torch.bfloat16)
-    labels = torch.randint(0, seq_len, (bs * seq_len,), dtype=torch.int32, device="npu")
-    loss_weight = torch.randn(bs * seq_len, device="npu", dtype=torch.float32)
-    logits.requires_grad = True
-    loss_weight.requires_grad = True
-    ignore_index = -100
-
-    # # Triton 融合算子
-    # triton_loss = fused_cross_entropy_loss(logits, loss_weight, labels)
-    # grad_output = torch.ones_like(triton_loss, dtype=torch.float32)
-    # grad_logits, grad_loss_weight = fused_cross_entropy_loss_back(logits, loss_weight, labels, ignore_index, grad_output)
-
-    # pt_loss = ChunkLoss.apply(logits, loss_weight, labels)
-    # pt_loss.backward()
-
-    with torch_npu.profiler.profile(
-        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
-        schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
-        experimental_config = torch_npu.profiler._ExperimentalConfig(profiler_level=torch_npu.profiler.ProfilerLevel.Level1),
-        record_shapes=True,#采集torch op的input shape和input type的开关
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./perf_part"),
-    ) as prof:
-        # Triton 融合算子
-        triton_loss = fused_cross_entropy_loss(logits, loss_weight, labels)
-        grad_output = torch.ones_like(triton_loss, dtype=torch.float32)
-        grad_logits, grad_loss_weight = fused_cross_entropy_loss_back(logits, loss_weight, labels, ignore_index, grad_output)
-        # Pytorch 算子
-        pt_loss = ChunkLoss.apply(logits, loss_weight, labels)
-        pt_loss.backward()
-
-        prof.step()   
-
-    # 对比结果（误差 < 1e-6 说明完全一致）
-    print("PyTorch 损失:", pt_loss.item())
-    print("Triton 损失:", triton_loss.item())
-    print("正向 误差:", torch.abs(pt_loss - triton_loss).sum())
-
-    print("PyTorch grad_logits:", grad_logits)
-    print("Triton grad_logits:", grad_logits)
-    print("PyTorch grad_loss_weight:", grad_loss_weight)
-    print("Triton grad_loss_weight:", grad_loss_weight)
-
-    print("grad_logits误差:", grad_logits.shape, torch.max(torch.abs(grad_logits - logits.grad)))
-    print("grad_loss_weight:", grad_loss_weight.shape, torch.max(torch.abs(grad_loss_weight - loss_weight.grad)))
