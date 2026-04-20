@@ -643,7 +643,7 @@ class MoE(BaseModel):
                     seq_ctx=seq_ctx,
                 )
             else:
-                if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
+                if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1 and int(idx) > 0:
                     with async_save_on_cpu(
                         h2d_stream=self.offload_stream,
                         d2h_stream=self.offload_stream,
