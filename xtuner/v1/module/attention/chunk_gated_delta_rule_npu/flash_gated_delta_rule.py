@@ -18,8 +18,8 @@ import torch_npu
 
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from .triton_core.solve_tril_fast import solve_tril_npu as solve_tril
 
-from .triton_core.solve_tril import solve_tril
 from .triton_core.cumsum import chunk_local_cumsum
 from .triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
@@ -52,7 +52,7 @@ def flash_chunk_gated_delta_rule_fwd(
     chunk_size: int = 64,
 ):
 
-    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, head_first=False)
+    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, chunk_indices_out=chunk_indices, head_first=False)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
