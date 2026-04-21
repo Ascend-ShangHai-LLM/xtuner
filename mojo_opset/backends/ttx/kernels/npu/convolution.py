@@ -90,7 +90,7 @@ def causal_conv1d_fwd_kernel_old(
 
         if not USE_INITIAL_STATE:
             for i_w in tl.static_range(-W + 1, 1):
-                yi_offset_0 = i_t * BT + i_w + tl.arange(0, BT)[:, None]
+                yi_offset_0 = (i_t * BT + i_w + tl.arange(0, BT)[:, None])
 
                 mask = (yi_offset_0 < T_len) & (yi_offset_1 < D) & (yi_offset_0 >= 0)
                 # We keep intra loop load because preloading will cause ub overflow under certain tiling.
@@ -101,14 +101,14 @@ def causal_conv1d_fwd_kernel_old(
                 b_y += b_yi
         elif i_t * BT >= W:
             for i_w in tl.static_range(-W + 1, 1):
-                yi_offset_0 = i_t * BT + i_w + tl.arange(0, BT)[:, None]
+                yi_offset_0 = (i_t * BT + i_w + tl.arange(0, BT)[:, None])
                 mask = (yi_offset_0 < T_len) & (yi_offset_1 < D) & (yi_offset_0 >= 0)
                 b_yi = tl.load(x + bos * D + yi_offset_0 * D + yi_offset_1, mask=mask, other=0.0).to(tl.float32)
                 if HAS_WEIGHT:
                     b_yi *= tl.extract_slice(b_w, [i_w + W - 1, 0], [1, BD], [1, 1])
                 b_y += b_yi
         else:
-            o_t = i_t * BT + tl.arange(0, BT)
+            o_t = (i_t * BT + tl.arange(0, BT))
             for i_w in tl.static_range(-W + 1, 1):
                 o_x = o_t + i_w
 
@@ -223,7 +223,7 @@ def causal_conv1d_fwd_kernel(
 
         if not USE_INITIAL_STATE:
             for i_w in tl.static_range(-W + 1, 1):
-                yi_offset_0 = i_t * BT + i_w + tl.arange(0, BT)[:, None]
+                yi_offset_0 = (i_t * BT + i_w + tl.arange(0, BT)[:, None])
 
                 mask = (yi_offset_0 < T_len) & (yi_offset_1 < D) & (yi_offset_0 >= 0)
                 # We keep intra loop load because preloading will cause ub overflow under certain tiling.
@@ -234,14 +234,14 @@ def causal_conv1d_fwd_kernel(
                 b_y += b_yi
         elif i_t * BT >= W:
             for i_w in tl.static_range(-W + 1, 1):
-                yi_offset_0 = i_t * BT + i_w + tl.arange(0, BT)[:, None]
+                yi_offset_0 = (i_t * BT + i_w + tl.arange(0, BT)[:, None])
                 mask = (yi_offset_0 < T_len) & (yi_offset_1 < D) & (yi_offset_0 >= 0)
                 b_yi = tl.load(x + bos * D + yi_offset_0 * D + yi_offset_1, mask=mask, other=0.0).to(tl.float32)
                 if HAS_WEIGHT:
                     b_yi *= tl.extract_slice(b_w, [i_w + W - 1, 0], [1, BD], [1, 1])
                 b_y += b_yi
         else:
-            o_t = i_t * BT + tl.arange(0, BT)
+            o_t = (i_t * BT + tl.arange(0, BT))
             for i_w in tl.static_range(-W + 1, 1):
                 o_x = o_t + i_w
 

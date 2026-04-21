@@ -1,0 +1,109 @@
+from typing import Optional
+
+import torch
+
+from mojo_opset.backends.ttx.kernels import paged_attention_decode
+from mojo_opset.backends.ttx.kernels import paged_attention_prefill
+from mojo_opset.backends.ttx.kernels import sdpa_infer
+from mojo_opset.core import MojoPagedDecodeGQA
+from mojo_opset.core import MojoPagedPrefillGQA
+from mojo_opset.core import MojoSdpa
+
+
+class TTXPagedPrefillGQA(MojoPagedPrefillGQA):
+    supported_platforms_list = ["npu"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.AUX_MASK_SIZE = 1024
+        self.aux_mask = None
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        block_tables: torch.Tensor,
+        softmax_scale: Optional[float] = None,
+        seqlens_kv: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        assert self.window_size == -1, (
+            f"[TTXPagedPrefillGQA] TTX does not support sliding window, but got window_size={self.window_size}"
+        )
+        assert self.is_causal, (
+            f"[TTXPagedPrefillGQA] TTX only support causal attention, but got is_causal={self.is_causal}"
+        )
+        assert mask is None, f"[TTXPagedPrefillGQA] TTX does not support mask, but got mask={mask}"
+        if self.aux_mask is None:
+            self.aux_mask = torch.ones(self.AUX_MASK_SIZE, self.AUX_MASK_SIZE * 3, dtype=torch.bool).tril(self.AUX_MASK_SIZE).npu()
+
+        output = paged_attention_prefill(
+            q=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            seqlens_kv=seqlens_kv,
+            block_tables=block_tables,
+            gqa_interleave=self.gqa_layout == "ABAB",
+            sm_scale=softmax_scale,
+            aux_mask=self.aux_mask,
+        )
+
+        return output
+
+
+class TTXPagedDecodeGQA(MojoPagedDecodeGQA):
+    supported_platforms_list = ["npu"]
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        seqlens: torch.Tensor,
+        block_tables: torch.Tensor,
+        softmax_scale: Optional[float] = None,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        assert self.window_size == -1, (
+            f"[TTXPagedDecodeGQA] TTX does not support sliding window, but got window_size={self.window_size}"
+        )
+        assert self.is_causal, (
+            f"[TTXPagedDecodeGQA] TTX only support causal attention, but got is_causal={self.is_causal}"
+        )
+        assert mask is None, f"[TTXPagedDecodeGQA] TTX does not support mask, but got mask={mask}"
+
+        output = paged_attention_decode(
+            q=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            seqlens=seqlens,
+            block_tables=block_tables,
+            gqa_interleave=self.gqa_layout == "ABAB",
+            sm_scale=softmax_scale,
+        )
+
+        return output
+
+
+class TTXSdpa(MojoSdpa):
+    supported_platforms_list = ["npu"]
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        output = sdpa_infer(
+            q=query,
+            k=key,
+            v=value,
+            mask=attn_mask,
+            scale=self.scale,
+            enable_gqa=self.enable_gqa,
+        )
+        return output
