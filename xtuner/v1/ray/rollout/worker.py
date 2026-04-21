@@ -135,6 +135,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.nccl_port = self.ports[2]
         self.dist_init_addr = f"{self.host}:{self.dist_port}"
         self.server_url = f"http://{self.host}:{self.server_port}"
+        self.nccl_url = f"tcp://localhost:{self.nccl_port}"
         return self.dist_init_addr
 
     def init(self, dist_init_addr: str = ""):

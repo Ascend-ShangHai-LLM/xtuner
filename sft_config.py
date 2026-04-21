@@ -74,14 +74,12 @@ float8_cfg = Float8Config(
 moe_cfg = Qwen3_5_VLMoE35BA3Config()
 
 moe_cfg.text_config.ep_size = 1
+moe_cfg.text_config.num_hidden_layers = 32
+if MTPConfig is not None:
 
-# if MTPConfig is not None:
+    moe_cfg.text_config.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=1.0)
 
-#     moe_cfg.text_config.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=1.0)
-
-# moe_cfg.text_config.layer_balancing_loss_cfg = LayerBalancingLossConfig()
-
-optim_cfg = AdamWConfig(lr=6e-05, foreach=False, )
+optim_cfg = AdamWConfig(lr=6e-05, foreach=False)  
 
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 
@@ -115,7 +113,7 @@ dataset_config = [
 
 dataloader_config = DataloaderConfig(
 
-    pack_max_length=64*1024,
+    pack_max_length=27*1024,
 
     pack_level="hard"
 
@@ -123,7 +121,7 @@ dataloader_config = DataloaderConfig(
 
 
 
-loss_cfg = CELossConfig(mode="chunk",chunk_size=2048)
+loss_cfg = CELossConfig(mode="chunk",chunk_size=512)
 
 
 
@@ -152,8 +150,6 @@ trainer = TrainerConfig(
     tokenizer_path=QWEN3_MOE_PATH,
 
     global_batch_size=32,
-    
-    sp_size=2,
 
 )
 

@@ -516,15 +516,27 @@ class RawDataFlow:
         return self.replay_buffer.status()
 
     async def _send_abort_request(self, client, url, timeout):
-        worker_url = f"{url}/abort_request"
-        try:
-            response = await client.post(worker_url, json={"abort_all": True}, timeout=timeout)
-            response.raise_for_status()
-            self.logger.debug(f"Successfully sent abort request to {url}")
-            return url, True
-        except Exception as e:
-            self.logger.error(f"Failed to send abort request to {url}: {e}")
-            return url, False
+        import os
+        if os.getenv("XTUNER_USE_VLLM", "0") == "1":
+            worker_url = f"{url}/pause"
+            try:
+                response = await client.post(worker_url, params={"mode": "abort", "clear_cache": False}, timeout=timeout)
+                response.raise_for_status()
+                self.logger.debug(f"Successfully sent abort request to {url}")
+                return url, True
+            except Exception as e:
+                self.logger.error(f"Failed to send abort request to {url}: {e}")
+                return url, False
+        else:
+            worker_url = f"{url}/abort_request"
+            try:
+                response = await client.post(worker_url, json={"abort_all": True}, timeout=timeout)
+                response.raise_for_status()
+                self.logger.debug(f"Successfully sent abort request to {url}")
+                return url, True
+            except Exception as e:
+                self.logger.error(f"Failed to send abort request to {url}: {e}")
+                return url, False
 
     def _log_task_completion_stats(self, task_times: List[float], logger_msg: Optional[str] = None):
         if not task_times:

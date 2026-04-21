@@ -1,31 +1,21 @@
-set -ex
-
-ray stop --force
-# 2. 清理临时目录（默认 /tmp/ray）
-rm -rf /tmp/ray/*
-sysctl -w net.ipv4.tcp_max_syn_backlog=65536
-sysctl -w net.core.somaxconn=65536
-sysctl -w net.ipv4.ip_local_reserved_ports=60000-60015
-
-# cd ../../mojo_opset/
-# pip install -e .
-cd /mnt/huawei/rl_qwen35/code/xtuner
-
+      
 config_file=${1}
 datetime=$(date +%Y%m%d_%H%M%S)
 log_dir="logs/${datetime}"
 
-source /usr/local/Ascend/cann-8.5.0/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
 
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流内存复用
 export XTUNER_ACTIVATION_OFFLOAD=1 # 激活值offload
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True # 虚拟内存128M
-unset TORCH_HCCL_ZERO_COPY # 关闭HCCL zero copy
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True,segment_size_mb:128 # 虚拟内存128M
 
 export TASK_QUEUE_ENABLE=2 # 算子二级流水
-export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
 # 绑核
+export CPU_AFFINITY_FORCE=True
+export CPU_AFFINITY_CONF=1,npu0:12-23,npu1:26-37,npu2:52-63,npu3:66-77,npu4:92-103,npu5:106-117,npu6:132-143,npu7:146-157,npu8:172-183,npu9:186-197,npu10:212-223,npu11:226-237,npu12:252-263,npu13:266-277,npu14:292-303,npu15:306-317
+export TRITON_ALWAYS_COMPILE=1
 
 export XTUNER_TOKENIZE_WORKERS=1
 
@@ -46,15 +36,12 @@ if [ "x${NPROC_PER_NODE}" == "x" ]; then
 NPROC_PER_NODE=${PROC_PER_NODE-"8"}  # yidian
 fi
 
-# hyf
+export TRITON_ALL_BLOCKS_PARALLEL=1 # triton算子需要
 export WORLD_SIZE=${WORLD_SIZE:-$NODE_COUNT}
 export RANK=${RANK:-$NODE_RANK} 
 
 
-export MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
 export MEDIA_ROOT=''
-# xtuner_dir="/mnt/huawei/hyf/xtuner_0403"
-# export PYTHONPATH=$xtuner_dir:$PYTHONPATH
 
 NRANK=${NRANK-"0"}
 NNODES=2
@@ -87,3 +74,5 @@ else
     if [ $status -ne 0 ]; then exit $status; fi
     echo "---------------------------END--------------------------------" | tee -a "${log_dir}/node_${NRANK}.txt"
 fi
+
+    
