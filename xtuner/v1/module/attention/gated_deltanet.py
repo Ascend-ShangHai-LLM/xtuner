@@ -457,6 +457,7 @@ class GatedDeltaNet(nn.Module):
             query, _ = causal_conv1d_triton(
                 x=query,
                 weight=query_weight,
+                H=int(self.num_k_heads/sp_size),
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
@@ -464,6 +465,7 @@ class GatedDeltaNet(nn.Module):
             key, _ = causal_conv1d_triton(
                 x=key,
                 weight=key_weight,
+                H=int(self.num_k_heads/sp_size),
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
@@ -471,6 +473,7 @@ class GatedDeltaNet(nn.Module):
             value, _ = causal_conv1d_triton(
                 x=value,
                 weight=value_weight,
+                H=int(self.num_v_heads/sp_size),
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
@@ -489,19 +492,19 @@ class GatedDeltaNet(nn.Module):
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         # (1,key_dim/sp_size, L)
-        query = query.transpose(1, 2).reshape(
-            batch_size, seq_len * sp_size, -1, self.head_k_dim
-        )  # (1, L, num_k_heads/sp_size, head_k_dim)
-        key = key.transpose(1, 2).reshape(
-            batch_size, seq_len * sp_size, -1, self.head_k_dim
-        )  # (1, L, num_k_heads/sp_size, head_k_dim)
-        value = value.transpose(1, 2).reshape(
-            batch_size, seq_len * sp_size, -1, self.head_v_dim
-        )  # (1, L, num_v_heads/sp_size, head_v_dim)
+        # query = query.transpose(1, 2).reshape(
+        #     batch_size, seq_len * sp_size, -1, self.head_k_dim
+        # )  # (1, L, num_k_heads/sp_size, head_k_dim)
+        # key = key.transpose(1, 2).reshape(
+        #     batch_size, seq_len * sp_size, -1, self.head_k_dim
+        # )  # (1, L, num_k_heads/sp_size, head_k_dim)
+        # value = value.transpose(1, 2).reshape(
+        #     batch_size, seq_len * sp_size, -1, self.head_v_dim
+        # )  # (1, L, num_v_heads/sp_size, head_v_dim)
 
         if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
 
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             g = g.transpose(1, 2)
@@ -532,6 +535,9 @@ class GatedDeltaNet(nn.Module):
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q,
+            cu_seqlens_list=seq_ctx.cu_seq_lens_list,
+            chunk_indices=seq_ctx.chunk_indices,
+            chunk_indices_list=seq_ctx.chunk_indices_list 
         )
        
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
