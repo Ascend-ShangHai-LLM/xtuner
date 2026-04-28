@@ -26,6 +26,7 @@ from xtuner.v1.data_proto.rl_data import (
     is_valid_for_replaybuffer,
 )
 from xtuner.v1.datasets.config import DataloaderConfig
+from xtuner.v1.ray.utils import free_object_refs
 from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.device import get_device
 
@@ -80,6 +81,8 @@ def determine_group_state(group_data_items: List[RLDataFlowItem]) -> RolloutStat
         return RolloutState.SKIPPED
     elif RolloutState.FAILED in group_states:
         return RolloutState.FAILED
+    elif RolloutState.EXPIRED in group_states:
+        return RolloutState.EXPIRED
     elif RolloutState.ABORTED in group_states:
         return RolloutState.ABORTED
     elif all(state == RolloutState.COMPLETED for state in group_states):
@@ -742,6 +745,18 @@ class ReplayBufferStorage:
 
         return action_id
 
+    def _update_replay_meta_state(self, replay_meta: ReplayMeta, new_state: RolloutState):
+        """Updates replay_meta.state and keeps _states / _observations2states in sync."""
+        for observation_id in replay_meta.observation_ids:
+            old_state = self._observations2states.get(observation_id)
+            if old_state and observation_id in self._states.get(old_state, []):
+                self._states[old_state].remove(observation_id)
+            self._observations2states[observation_id] = new_state
+            if observation_id not in self._states[new_state]:
+                self._states[new_state].append(observation_id)
+        replay_meta.state = new_state
+
+
     def _check_completed_samples_expired(self):
         """Moves samples from completed buckets to the expired list if they are
         too old after get target completed samples from replay buffer.
@@ -758,6 +773,12 @@ class ReplayBufferStorage:
 
         for version in expired_versions:
             bucket = self._completed_actions.pop(version)
+            for action_id in bucket:
+                replay_meta = self._actions.get(action_id)
+                if replay_meta is not None:
+                    self._update_replay_meta_state(replay_meta, RolloutState.EXPIRED)
+                    if self.tail_batch_trigger_size <= 0:
+                        self._clear_multimodal_objectrefs(replay_meta)
             self._expired_actions.extend(bucket)
             self.logger.info(
                 f"Moved {len(bucket)} completed samples with version {version} to expired samples due to exceeding tail_batch_candidate_steps."
@@ -781,6 +802,7 @@ class ReplayBufferStorage:
         This is the single source of truth for deleting an action.
         """
         action_id = replay_meta.action_id
+        root_id = replay_meta.root_id
 
         for observation_id in replay_meta.observation_ids:
             self._observations.pop(observation_id, None)
@@ -789,6 +811,12 @@ class ReplayBufferStorage:
                 self._states[state].remove(observation_id)
 
         self._action2observations.pop(action_id, None)
+        if root_id in self._root2actions:
+            self._root2actions[root_id] = [
+                stored_action_id for stored_action_id in self._root2actions[root_id] if stored_action_id != action_id
+            ]
+            if not self._root2actions[root_id]:
+                del self._root2actions[root_id]
         del replay_meta
 
     def _clear_meta_for_root(self, replay_meta: ReplayMeta):
@@ -814,6 +842,32 @@ class ReplayBufferStorage:
             del self._root2actions[root_id]
         del replay_meta
 
+    def _clear_multimodal_objectrefs(self, replay_meta: ReplayMeta):
+        if replay_meta.action_ref is None:
+            return
+
+        data_item = ray.get(replay_meta.action_ref)
+        multimodal_info = getattr(data_item, "multimodal_train_info", None)
+        if not multimodal_info:
+            return
+
+        refs_to_free: List[ObjectRef] = []
+        changed = False
+        for key, value in list(multimodal_info.items()):
+            if isinstance(value, ObjectRef):
+                refs_to_free.append(value)
+                multimodal_info[key] = None
+                changed = True
+
+        if not changed:
+            return
+
+        old_action_ref = replay_meta.action_ref
+        replay_meta.action_ref = ray.put(data_item)
+        if isinstance(old_action_ref, ObjectRef):
+            refs_to_free.append(old_action_ref)
+        free_object_refs(refs_to_free)
+
     def _check_rollout_state_and_insert(self, replay_meta: ReplayMeta):
         """Checks the rollout state of a ReplayMeta object and inserts its
         action_id into the appropriate state bucket.
@@ -835,9 +889,12 @@ class ReplayBufferStorage:
             if self.tail_batch_candidate_steps > 0 and replay_meta.version >= self.tail_batch_candidate_steps:
                 # 过期的数据需要重置状态
                 self._expired_actions.append(action_id)
+                self._update_replay_meta_state(replay_meta, RolloutState.EXPIRED)
                 self.logger.debug(
                     f"Add expired sample with action_id: {action_id} to _expired_actions because version: {replay_meta.version} >= tail_batch_candidate_steps: {self.tail_batch_candidate_steps}."
                 )
+                if self.tail_batch_trigger_size <= 0:
+                    self._clear_multimodal_objectrefs(replay_meta)
             else:
                 self._aborted_actions[replay_meta.version].append(action_id)
                 self.logger.debug(
