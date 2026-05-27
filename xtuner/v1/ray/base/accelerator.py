@@ -18,7 +18,7 @@ from typing_extensions import Annotated
 from ..utils import find_master_addr_and_port, get_accelerator_ids
 
 
-PG_READY_TIMEOUT = os.getenv("XTUNER_PG_READY_TIMEOUT", 30)  # default 30 seconds
+PG_READY_TIMEOUT = int(os.getenv("XTUNER_PG_READY_TIMEOUT", 30))  # default 30 seconds
 AcceleratorType = Literal["GPU", "NPU"]
 T = TypeVar("T")
 

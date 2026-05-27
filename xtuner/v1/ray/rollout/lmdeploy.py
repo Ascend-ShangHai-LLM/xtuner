@@ -334,7 +334,7 @@ class LMDeployWorker(RolloutWorker):
             )
         )
         if backend == "pytorch" and self.accelerator == "NPU":
-            backend_config.eager_mode = True
+            backend_config.eager_mode = False
 
         env = dict()
         if backend == "pytorch":
@@ -353,6 +353,10 @@ class LMDeployWorker(RolloutWorker):
                         "ASCEND_SET_RT_VISIBLE_DEVICES_BY_RAY": "1",
                         "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
                         "DLINFER_RESET_MOE_UPDATE_WEIGHTS": "1",
+                        "LMDEPLOY_ASCEND_PRESERVE_GRAPHS": "1",
+                        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:False",
+                        "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+                        "LMDEPLOY_ASCEND_VLLM_ASCEND_PATH": "/s2_preview_rl_v1/codebase/vllm-ascend",
                     }
                 )
 
