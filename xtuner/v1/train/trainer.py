@@ -857,10 +857,11 @@ class Trainer:
                 _ = self._maybe_save(is_snapshot=True)
 
             time_before_get_data = time.time()
-
-            if self.cur_step % 50 == 0:
+            max_memory = DEVICE_MODULE.max_memory_allocated()                
+            if self.cur_step % 20 == 0 or max_memory / (1024**3) > 33:
                 gc.collect()
-
+                DEVICE_MODULE.empty_cache()
+        
         # TODO: Should use flush rather than close
         self._exp_tracker.close()
         if self._metrics_recorder:
