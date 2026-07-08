@@ -406,16 +406,25 @@ class MoEDecoderLayer(nn.Module):
                 rank = torch.distributed.get_rank()
                 filename = os.path.join(log_dir, f"all_layers_tokens_per_expert_{rank}.csv")
                 
-                # Check if file exists to determine if we need to write header
+                max_csv_rows = int(os.environ.get("XTUNER_EXPERT_STATS_MAX_ROWS", "6000"))
+                header = ['layer_idx'] + [f'expert_id_{i}' for i in range(self.n_routed_experts)]
+
+                # Refill the CSV after max_csv_rows data rows to avoid unbounded growth.
                 file_exists = os.path.exists(filename)
-                
-                # Write to CSV in append mode
-                with open(filename, 'a', newline='') as csvfile:
+                write_header = not file_exists
+                mode = 'a'
+                if file_exists and max_csv_rows > 0:
+                    with open(filename, 'r', newline='') as csvfile:
+                        # The first line is the header, so only count data rows.
+                        current_rows = max(sum(1 for _ in csvfile) - 1, 0)
+                    if current_rows >= max_csv_rows:
+                        mode = 'w'
+                        write_header = True
+
+                with open(filename, mode, newline='') as csvfile:
                     writer = csv.writer(csvfile)
-                    # Write header only if file is newly created
-                    if not file_exists:
-                        writer.writerow(['layer_idx'] + [f'expert_id_{i}' for i in range(self.n_routed_experts)])
-                    # Write data for each EP rank and expert
+                    if write_header:
+                        writer.writerow(header)
                     writer.writerow([self.layer_idx] + tokens_per_expert_gathered.tolist())
                 
                 # print(f"[EP Rank {ep_rank}] Appended layer {self.layer_idx} tokens_per_expert to {filename}")
@@ -446,7 +455,7 @@ class MoEDecoderLayer(nn.Module):
         #     post_dispatched.get("row_ids_map"),  # type: ignore[arg-type]
         #     dispatched["topk_weights"],
         # )
-        self._token_distribution_across_experts(post_dispatched["tokens_per_expert"], skip=True)
+        self._token_distribution_across_experts(post_dispatched["tokens_per_expert"], skip=False)
 
         experts_out = self.experts(
             post_dispatched["hidden_states"],
