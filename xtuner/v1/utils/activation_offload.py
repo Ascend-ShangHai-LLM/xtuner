@@ -153,8 +153,17 @@ class SwapTensor:
                 else:
                     self.tensor.storage().copy_(self.tensor_cpu.storage(), non_blocking=True)
                 self.h2d_event.record()
-                self.tensor.record_stream(h2dstream)
+                # The manager keeps this tensor alive until its backward consumer finishes;
+                # record_stream here would unnecessarily leave released NPU storage pending.
                 self.stat = "device"
+
+    def release_h2d_storage(self, working_stream):
+        """Release storage restored by prefetch after its backward consumer."""
+        if self.stat != "device":
+            return
+        working_stream.wait_event(self.h2d_event)
+        self.tensor.storage().resize_(0)
+        self.stat = "host"
 
     # synchronize h2d
     def wait_h2d_finished(self):
@@ -251,11 +260,11 @@ class OffloadManager(metaclass=SingletonMeta):
 
     def del_may_npu_tensor(self, profile_keys, h2d_stream):
         may_npu_tensor_keys = list(self.may_npu_tensors.keys())
+        working_stream = torch.cuda.current_stream()
         for key in may_npu_tensor_keys:
             if key.startswith(profile_keys):
-                with torch.cuda.stream(h2d_stream):
-                    h2d_stream.wait_event(self.may_npu_tensors[key].act.h2d_event)
-                    del self.may_npu_tensors[key]
+                self.may_npu_tensors[key].act.release_h2d_storage(working_stream)
+                del self.may_npu_tensors[key]
 
     def get(self, key):
         self.assert_exist(key)

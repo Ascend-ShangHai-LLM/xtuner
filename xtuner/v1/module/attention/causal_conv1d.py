@@ -25,6 +25,9 @@ class CausalConv1dFunction(torch.autograd.Function):
         output_final_state: bool = False,
     ):
         # Save necessary tensors for backward pass
+        # Avoid materializing an all-zero dht when the final state is not
+        # consumed (for example, on the last serial-SP chunk).
+        ctx.set_materialize_grads(False)
         # x = x.transpose(-1, -2).contiguous()
         weight = weight.transpose(-1, -2).contiguous()
         ctx.save_for_backward(x, weight, bias, residual, initial_state)
@@ -48,9 +51,6 @@ class CausalConv1dFunction(torch.autograd.Function):
         )
         # y = y.transpose(-1, -2).contiguous()
         # weight = weight.transpose(-1, -2).contiguous()
-        # Save final_state if needed for backward
-        ctx.final_state = final_state
-
         return y, final_state
 
     @staticmethod

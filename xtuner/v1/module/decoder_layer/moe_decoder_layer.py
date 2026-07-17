@@ -299,6 +299,8 @@ class MoEDecoderLayer(nn.Module):
         seq_ctx: SequenceContext | list[SequenceContext],
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         layer_idx: int = -1,
+        serial_sp_history_k: torch.Tensor | None = None,
+        serial_sp_history_v: torch.Tensor | None = None,
     ) -> tuple[HiddenStates, RouterResults] | tuple[torch.Tensor, ...]:
         """Forward pass of the MoE decoder layer.
 
@@ -318,12 +320,40 @@ class MoEDecoderLayer(nn.Module):
             assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2, (
                 "position_embeddings should be a tuple of two tensors (position_ids, position_embeds)"
             )
-            return self._forward(
+            if hasattr(seq_ctx, "kvcache") and seq_ctx.kvcache is not None:
+                cache = seq_ctx.kvcache
+                if isinstance(self.self_attn, GatedDeltaNet):
+                    cache.history_k, cache.history_v = None, None
+                    cache.history_conv_state = serial_sp_history_k
+                    cache.history_delta_state = serial_sp_history_v
+                else:
+                    cache.history_k = serial_sp_history_k
+                    cache.history_v = serial_sp_history_v
+            outputs = self._forward(
                 hidden_states=hidden_states[0],
                 seq_ctx=seq_ctx,
                 position_embeddings=position_embeddings,
                 layer_idx = layer_idx,
             )
+            if hasattr(seq_ctx, "kvcache") and seq_ctx.kvcache is not None:
+                cache = seq_ctx.kvcache
+                if isinstance(self.self_attn, GatedDeltaNet):
+                    assert cache.output_conv_state is not None
+                    assert cache.output_delta_state is not None
+                    output_k = cache.output_conv_state
+                    output_v = cache.output_delta_state
+                else:
+                    assert cache.output_k is not None
+                    assert cache.output_v is not None
+                    output_k = cache.output_k
+                    output_v = cache.output_v
+                cache.history_k, cache.history_v = None, None
+                cache.output_k, cache.output_v = None, None
+                cache.history_conv_state, cache.history_delta_state = None, None
+                cache.output_conv_state, cache.output_delta_state = None, None
+
+                return (*outputs, output_k, output_v)
+            return outputs
         else:
             assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states), (
                 "seq_ctx should be a list of SequenceContext instances with the same length as hidden_states"

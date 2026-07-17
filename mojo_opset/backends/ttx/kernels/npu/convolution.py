@@ -79,7 +79,6 @@ def causal_conv1d_fwd_kernel_old(
         o_w = tl.arange(0, W)
         m_d = o_d < D
         m_w = o_w >= 0
-
         if HAS_WEIGHT:
             p_w = tl.make_block_ptr(weight, (W, D), (D, 1), (0, i_d * BD), (W, BD), (1, 0))
             b_w = tl.load(p_w, boundary_check=(0, 1))
@@ -293,9 +292,139 @@ def causal_conv1d_fwd_kernel(
 
 @triton.heuristics(
     {
+        "HAS_BIAS": lambda args: args["bias"] is not None,
+        "HAS_RESIDUAL": lambda args: args["residual"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit
+def causal_conv1d_state_fwd_boundary_kernel(
+    x,
+    y,
+    weight,
+    bias,
+    residual,
+    initial_state,
+    cu_seqlens,
+    T,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BD: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    OUTPUT_HEAD_LAYOUT: tl.constexpr,
+):
+    """Overwrite only the sequence prefix whose convolution uses history."""
+    i_d, i_n = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T_len = eos - bos
+    else:
+        bos = (i_n * T).to(tl.int64)
+        T_len = T
+
+    o_t = tl.arange(0, W)
+    o_d = i_d * BD + tl.arange(0, BD)
+    m_d = o_d < D
+    b_y = tl.zeros((W, BD), dtype=tl.float32)
+
+    for i_w in tl.static_range(-W + 1, 1):
+        source_t = o_t + i_w
+        x_mask = (source_t >= 0)[:, None] & (source_t < T_len)[:, None] & m_d[None, :]
+        state_slot = source_t + W
+        state_mask = (source_t < 0)[:, None] & (state_slot >= 0)[:, None] & m_d[None, :]
+        b_source = tl.load(
+            x + (bos + source_t[:, None]) * D + o_d[None, :],
+            mask=x_mask,
+            other=0.0,
+        ).to(tl.float32)
+        b_source += tl.load(
+            initial_state + i_n * D * W + o_d[None, :] * W + state_slot[:, None],
+            mask=state_mask,
+            other=0.0,
+        ).to(tl.float32)
+        b_weight = tl.load(
+            weight + (i_w + W - 1) * D + o_d,
+            mask=m_d,
+            other=0.0,
+        ).to(tl.float32)
+        b_y += b_source * b_weight[None, :]
+
+    if HAS_BIAS:
+        b_y += tl.load(bias + o_d, mask=m_d, other=0.0).to(tl.float32)[None, :]
+    if ACTIVATION == "swish" or ACTIVATION == "silu":
+        b_y = b_y * tl.sigmoid(b_y)
+    if HAS_RESIDUAL:
+        b_y += tl.load(
+            residual + (bos + o_t[:, None]) * D + o_d[None, :],
+            mask=(o_t < T_len)[:, None] & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+    output_mask = (o_t < T_len)[:, None] & m_d[None, :]
+    if OUTPUT_HEAD_LAYOUT:
+        K: tl.constexpr = D // H
+        o_head = o_d // K
+        o_k = o_d % K
+        if IS_VARLEN:
+            output_batch_off = 0
+            output_time = bos + o_t[:, None]
+        else:
+            output_batch_off = i_n * H * T * K
+            output_time = o_t[:, None]
+        output_ptr = y + output_batch_off + o_head[None, :] * T * K + output_time * K + o_k[None, :]
+    else:
+        output_ptr = y + (bos + o_t[:, None]) * D + o_d[None, :]
+    tl.store(
+        output_ptr,
+        tl.cast(b_y, dtype=y.dtype.element_ty, fp_downcast_rounding="rtne"),
+        mask=output_mask,
+    )
+
+
+def _causal_conv1d_apply_initial_state(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    H: int,
+    bias: Optional[torch.Tensor],
+    residual: Optional[torch.Tensor],
+    initial_state: torch.Tensor,
+    activation: Optional[str],
+    cu_seqlens: Optional[torch.Tensor],
+    output_head_layout: bool,
+) -> None:
+    B, T, D = x.shape
+    W = weight.shape[0]
+    N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
+    BD = min(D, 128)
+    causal_conv1d_state_fwd_boundary_kernel[(triton.cdiv(D, BD), N)](
+        x=x,
+        y=y,
+        weight=weight,
+        bias=bias,
+        residual=residual,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        T=T,
+        D=D,
+        H=H,
+        W=W,
+        BD=BD,
+        ACTIVATION=activation,
+        OUTPUT_HEAD_LAYOUT=output_head_layout,
+        multibuffer=False,
+    )
+
+
+@triton.heuristics(
+    {
         "HAS_WEIGHT": lambda args: args["dw"] is not None,
         "HAS_BIAS": lambda args: args["db"] is not None,
-        "USE_INITIAL_STATE": lambda args: args["dh0"] is not None,
         "USE_FINAL_STATE": lambda args: args["dht"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
@@ -373,6 +502,19 @@ def causal_conv1d_bwd_kernel(
         m_d = o_d < D
         m_w = o_w >= 0
 
+        o_t = i_t * BT + tl.arange(0, BT)
+        K: tl.constexpr = D // H
+        HEADS_PER_BLOCK: tl.constexpr = BD // K
+        head_start = (i_d * BD) // K
+        o_head = o_d // K
+        o_k = o_d % K
+        if IS_VARLEN:
+            dy_batch_off = 0
+            dy_time_off = bos
+        else:
+            dy_batch_off = i_n * H * T * K
+            dy_time_off = 0
+
         if HAS_WEIGHT:
             p_x = tl.make_block_ptr(x + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
             b_x = tl.load(p_x, boundary_check=(0, 1))
@@ -387,13 +529,10 @@ def causal_conv1d_bwd_kernel(
         if not USE_FINAL_STATE:
             b_dw = tl.zeros((W, BD), dtype=tl.float32)
 
-            K: tl.constexpr = D // H
-            HEADS_PER_BLOCK: tl.constexpr = BD // K
-            head_start = (i_d * BD) // K
             # B T H K
             # B H T K
             p_dy = tl.make_block_ptr(
-                dy + bos * K  + head_start * T * K,
+                dy + dy_batch_off + dy_time_off * K + head_start * T * K,
                 (T_len, HEADS_PER_BLOCK, K),
                 (K, T * K, 1),
                 (i_t * BT, 0, 0),
@@ -401,15 +540,21 @@ def causal_conv1d_bwd_kernel(
                 (2, 1, 0),
             )
             b_dy = tl.load(p_dy, boundary_check=(0, 1, 2)).to(tl.float32)
-            b_dy = tl.reshape(b_dy, (BT * W, BD))  # for better readability, no actual reshape
+            b_dy = tl.reshape(b_dy, (BT * W, BD))
 
             if ACTIVATION == "swish" or ACTIVATION == "silu":
-                p_y = tl.make_block_ptr(y + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT * W, BD), (1, 0))
+                p_y = tl.make_block_ptr(
+                    y + bos * D,
+                    (T_len, D),
+                    (D, 1),
+                    (i_t * BT, i_d * BD),
+                    (BT * W, BD),
+                    (1, 0),
+                )
                 b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
 
             for i_w in tl.static_range(0, W):
                 b_dy_sub = tl.extract_slice(b_dy, [i_w, 0], [BT, BD], [1, 1])
-
                 if ACTIVATION == "swish" or ACTIVATION == "silu":
                     b_y_sub = tl.extract_slice(b_y, [i_w, 0], [BT, BD], [1, 1])
                     b_ys = tl.sigmoid(b_y_sub)
@@ -419,25 +564,46 @@ def causal_conv1d_bwd_kernel(
                 if HAS_WEIGHT:
                     b_wdy = b_wdy * tl.extract_slice(b_w, [W - i_w - 1, 0], [1, BD], [1, 1])
 
-                    b_dw_sub = tl.sum(b_dy_sub * b_x, 0)  # [BT, BD] * [BT, BD] --> sum(0) = [BD]
-                    b_dw = tl.insert_slice(b_dw, b_dw_sub[None, :], [W - i_w - 1, 0], [1, BD], [1, 1])
+                    b_dw_sub = tl.sum(b_dy_sub * b_x, 0)
+                    b_dw = tl.insert_slice(
+                        b_dw,
+                        b_dw_sub[None, :],
+                        [W - i_w - 1, 0],
+                        [1, BD],
+                        [1, 1],
+                    )
 
                 if HAS_BIAS and i_w == 0:
                     b_db += tl.sum(b_dy_sub, 0)
                 b_dx += b_wdy
 
-            p_dw = tl.make_block_ptr(dw + i_tg * W * D, (W, D), (D, 1), (0, i_d * BD), (W, BD), (1, 0))
-            tl.store(p_dw, b_dw.to(dw.dtype.element_ty))
+            p_dw = tl.make_block_ptr(
+                dw + i_tg * W * D,
+                (W, D),
+                (D, 1),
+                (0, i_d * BD),
+                (W, BD),
+                (1, 0),
+            )
+            tl.store(p_dw, b_dw.to(dw.dtype.element_ty), boundary_check=(0, 1))
+
         elif i_t * BT >= W:
             for i_w in tl.static_range(0, W):
-                p_dy = tl.make_block_ptr(dy + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0))
-
-                b_dy = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
+                p_dy = tl.make_block_ptr(
+                    dy + bos * K + head_start * T * K,
+                    (T_len, HEADS_PER_BLOCK, K),
+                    (K, T * K, 1),
+                    (i_t * BT + i_w, 0, 0),
+                    (BT, HEADS_PER_BLOCK, K),
+                    (2, 1, 0),
+                )
+                b_dy = tl.load(p_dy, boundary_check=(0, 1, 2), padding_option="zero").to(tl.float32)
+                b_dy = tl.reshape(b_dy, (BT, BD))
                 if ACTIVATION == "swish" or ACTIVATION == "silu":
                     p_y = tl.make_block_ptr(
                         y + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0)
                     )
-                    b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
+                    b_y = tl.load(p_y, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
                     b_ys = tl.sigmoid(b_y)
                     b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
                 b_wdy = b_dy
@@ -445,20 +611,31 @@ def causal_conv1d_bwd_kernel(
                     b_wdy = b_wdy * tl.extract_slice(b_w, [W - i_w - 1, 0], [1, BD], [1, 1])
 
                     b_dw = tl.sum(b_dy * b_x, 0)
-                    tl.store(dw + i_tg * D * W + o_d * W + W - i_w - 1, b_dw.to(dw.dtype.element_ty), mask=m_d)
+                    tl.store(
+                        dw + i_tg * W * D + (W - i_w - 1) * D + o_d,
+                        b_dw.to(dw.dtype.element_ty),
+                        mask=m_d,
+                    )
                 if HAS_BIAS and i_w == 0:
                     b_db += tl.sum(b_dy, 0)
                 b_dx += b_wdy
         else:
-            o_t = i_t * BT + tl.arange(0, BT)
             for i_w in tl.static_range(0, W):
-                p_dy = tl.make_block_ptr(dy + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0))
-                b_dy_shift = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
+                p_dy = tl.make_block_ptr(
+                    dy + bos * K + head_start * T * K,
+                    (T_len, HEADS_PER_BLOCK, K),
+                    (K, T * K, 1),
+                    (i_t * BT + i_w, 0, 0),
+                    (BT, HEADS_PER_BLOCK, K),
+                    (2, 1, 0),
+                )
+                b_dy_shift = tl.load(p_dy, boundary_check=(0, 1, 2), padding_option="zero").to(tl.float32)
+                b_dy_shift = tl.reshape(b_dy_shift, (BT, BD))
                 if ACTIVATION == "swish" or ACTIVATION == "silu":
                     p_y = tl.make_block_ptr(
                         y + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0)
                     )
-                    b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
+                    b_y = tl.load(p_y, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
                     b_ys = tl.sigmoid(b_y)
                     b_dy_shift = b_dy_shift * b_ys * (1 + b_y * (1 - b_ys))
                 if HAS_WEIGHT:
@@ -467,11 +644,19 @@ def causal_conv1d_bwd_kernel(
                     if USE_INITIAL_STATE:
                         mask_head_rows = o_t < i_w
 
+                        p_dy_head = tl.make_block_ptr(
+                            dy + bos * K + head_start * T * K,
+                            (T_len, HEADS_PER_BLOCK, K),
+                            (K, T * K, 1),
+                            (i_t * BT, 0, 0),
+                            (BT, HEADS_PER_BLOCK, K),
+                            (2, 1, 0),
+                        )
                         b_dy_head = tl.load(
-                            dy + bos * D + o_t[:, None] * D + o_d,
-                            mask=(mask_head_rows[:, None] & m_d[None, :]),
-                            other=0.0,
+                            p_dy_head, boundary_check=(0, 1, 2), padding_option="zero"
                         ).to(tl.float32)
+                        b_dy_head = tl.reshape(b_dy_head, (BT, BD))
+                        b_dy_head = tl.where(mask_head_rows[:, None], b_dy_head, 0.0)
                         if ACTIVATION == "swish" or ACTIVATION == "silu":
                             b_y_head = tl.load(
                                 y + bos * D + o_t[:, None] * D + o_d,
@@ -490,7 +675,11 @@ def causal_conv1d_bwd_kernel(
                         ).to(tl.float32)
 
                         b_dw += tl.sum(b_dy_head * b_xc, 0)
-                    tl.store(dw + i_tg * D * W + o_d * W + W - i_w - 1, b_dw.to(dw.dtype.element_ty), mask=m_d)
+                    tl.store(
+                        dw + i_tg * W * D + (W - i_w - 1) * D + o_d,
+                        b_dw.to(dw.dtype.element_ty),
+                        mask=m_d,
+                    )
 
                 if HAS_BIAS and i_w == 0:
                     b_db += tl.sum(b_dy_shift, 0)
@@ -502,27 +691,32 @@ def causal_conv1d_bwd_kernel(
                 b_dx += b_wdy
 
             if USE_INITIAL_STATE:
-                p_dy0 = tl.make_block_ptr(dy + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-                b_dy0 = tl.load(p_dy0, boundary_check=(0, 1)).to(tl.float32)
+                p_dy0 = tl.make_block_ptr(
+                    dy + bos * K + head_start * T * K,
+                    (T_len, HEADS_PER_BLOCK, K),
+                    (K, T * K, 1),
+                    (i_t * BT, 0, 0),
+                    (BT, HEADS_PER_BLOCK, K),
+                    (2, 1, 0),
+                )
+                b_dy0 = tl.load(p_dy0, boundary_check=(0, 1, 2), padding_option="zero").to(tl.float32)
+                b_dy0 = tl.reshape(b_dy0, (BT, BD))
                 if ACTIVATION == "swish" or ACTIVATION == "silu":
                     p_y0 = tl.make_block_ptr(y + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-                    b_y0 = tl.load(p_y0, boundary_check=(0, 1)).to(tl.float32)
+                    b_y0 = tl.load(p_y0, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
                     b_ys0 = tl.sigmoid(b_y0)
                     b_dy0 = b_dy0 * b_ys0 * (1 + b_y0 * (1 - b_ys0))
 
                 for i_w in tl.static_range(1, W):
-                    m_rows = o_t < i_w
-                    if HAS_WEIGHT:
-                        w_idx_rows = i_w - 1 - o_t
-
-                        w_mask = o_w[None, :] == w_idx_rows[:, None]
-                        w_pick = tl.sum(tl.trans(b_w)[None, :, :] * w_mask[:, None, :], 2)
-                    else:
-                        w_pick = 1.0
-                    contrib = (b_dy0 * w_pick).to(tl.float32)
-                    contrib = tl.where(m_rows[:, None] & m_d[None, :], contrib, 0.0)
-
-                    b_dh0_s = tl.sum(contrib, 0)
+                    b_dh0_s = tl.zeros((BD,), dtype=tl.float32)
+                    for i_k in tl.static_range(0, W):
+                        m_rows = o_t == i_w - 1 - i_k
+                        b_dy_sum = tl.sum(tl.where(m_rows[:, None], b_dy0, 0.0), 0)
+                        if HAS_WEIGHT:
+                            b_w_row = tl.sum(tl.extract_slice(b_w, [i_k, 0], [1, BD], [1, 1]), 0)
+                            b_dh0_s += b_dy_sum * b_w_row
+                        else:
+                            b_dh0_s += b_dy_sum
 
                     tl.store(
                         dh0 + i_t * B * D * W + i_n * D * W + o_d * W + i_w,
@@ -547,6 +741,178 @@ def causal_conv1d_bwd_kernel(
 
         p_dx = tl.make_block_ptr(dx + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
         tl.store(p_dx, tl.cast(b_dx, dtype=p_dx.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+
+
+@triton.jit
+def causal_conv1d_state_bwd_kernel(
+    dy,
+    y,
+    weight,
+    initial_state,
+    dht,
+    dh0,
+    dw_state,
+    cu_seqlens,
+    T,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BD: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_FINAL_STATE: tl.constexpr,
+):
+    i_d, i_n = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T_len = eos - bos
+        dy_batch_off = 0
+        dy_time_off = bos
+    else:
+        bos = (i_n * T).to(tl.int64)
+        T_len = T
+        dy_batch_off = i_n * H * T * (D // H)
+        dy_time_off = 0
+
+    K: tl.constexpr = D // H
+    o_t = tl.arange(0, W)
+    o_d = i_d * BD + tl.arange(0, BD)
+    m_d = o_d < D
+    o_head = o_d // K
+    o_k = o_d % K
+    m = (o_t[:, None] < T_len) & m_d[None, :]
+
+    p_dy = (
+        dy
+        + dy_batch_off
+        + o_head[None, :] * T * K
+        + (dy_time_off + o_t[:, None]) * K
+        + o_k[None, :]
+    )
+    b_dy = tl.load(p_dy, mask=m, other=0.0).to(tl.float32)
+    if ACTIVATION == "swish" or ACTIVATION == "silu":
+        b_y = tl.load(
+            y + bos * D + o_t[:, None] * D + o_d[None, :], mask=m, other=0.0
+        ).to(tl.float32)
+        b_ys = tl.sigmoid(b_y)
+        b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
+
+    # State slot c contributes to output t with weight[c - 1 - t].
+    tl.store(dh0 + i_n * D * W + o_d * W, 0.0, mask=m_d)
+    for i_c in tl.static_range(1, W):
+        b_dh = tl.zeros((BD,), dtype=tl.float32)
+        for i_t in tl.static_range(0, W):
+            if i_t < i_c:
+                b_dy_t = tl.sum(tl.extract_slice(b_dy, [i_t, 0], [1, BD], [1, 1]), 0)
+                b_w_t = tl.load(weight + (i_c - 1 - i_t) * D + o_d, mask=m_d, other=0.0).to(tl.float32)
+                b_dh += b_dy_t * b_w_t
+        if USE_FINAL_STATE:
+            final_slot = i_c - T_len
+            b_dh += tl.load(
+                dht + i_n * D * W + o_d * W + final_slot,
+                mask=m_d & (final_slot >= 0) & (final_slot < W),
+                other=0.0,
+            ).to(tl.float32)
+        tl.store(dh0 + i_n * D * W + o_d * W + i_c, b_dh, mask=m_d)
+
+    # Weight k receives state[c=k+1+t] at boundary output t.
+    for i_k in tl.static_range(0, W):
+        b_dw = tl.zeros((BD,), dtype=tl.float32)
+        for i_t in tl.static_range(0, W):
+            if i_t + i_k + 1 < W:
+                b_dy_t = tl.sum(tl.extract_slice(b_dy, [i_t, 0], [1, BD], [1, 1]), 0)
+                b_h = tl.load(
+                    initial_state + i_n * D * W + o_d * W + i_t + i_k + 1,
+                    mask=m_d,
+                    other=0.0,
+                ).to(tl.float32)
+                b_dw += b_dy_t * b_h
+        tl.store(dw_state + i_n * W * D + i_k * D + o_d, b_dw, mask=m_d)
+
+
+@triton.jit
+def causal_conv1d_final_state_bwd_kernel(
+    dy,
+    y,
+    weight,
+    dht,
+    dx,
+    cu_seqlens,
+    T,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BD: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Recompute only the tail dx values that receive final-state gradients."""
+    i_d, i_n = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T_len = eos - bos
+        dy_batch_off = 0
+        dy_time_off = bos
+    else:
+        bos = (i_n * T).to(tl.int64)
+        T_len = T
+        dy_batch_off = i_n * H * T * (D // H)
+        dy_time_off = 0
+
+    K: tl.constexpr = D // H
+    o_r = tl.arange(0, W)
+    o_d = i_d * BD + tl.arange(0, BD)
+    m_d = o_d < D
+    num_tail_tokens = tl.minimum(T_len, W)
+    token_start = tl.maximum(0, T_len - W)
+    state_slot_start = tl.maximum(0, W - T_len)
+    token_t = token_start + o_r
+    token_mask = (o_r < num_tail_tokens)[:, None] & m_d[None, :]
+    o_head = o_d // K
+    o_k = o_d % K
+    b_dx = tl.zeros((W, BD), dtype=tl.float32)
+
+    for i_w in tl.static_range(0, W):
+        output_t = token_t + i_w
+        output_mask = token_mask & (output_t < T_len)[:, None]
+        b_dy = tl.load(
+            dy
+            + dy_batch_off
+            + o_head[None, :] * T * K
+            + (dy_time_off + output_t[:, None]) * K
+            + o_k[None, :],
+            mask=output_mask,
+            other=0.0,
+        ).to(tl.float32)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            b_y = tl.load(
+                y + (bos + output_t[:, None]) * D + o_d[None, :],
+                mask=output_mask,
+                other=0.0,
+            ).to(tl.float32)
+            b_ys = tl.sigmoid(b_y)
+            b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
+        b_weight = tl.load(
+            weight + (W - i_w - 1) * D + o_d,
+            mask=m_d,
+            other=0.0,
+        ).to(tl.float32)
+        b_dx += b_dy * b_weight[None, :]
+
+    final_slot = state_slot_start + o_r
+    b_dx += tl.load(
+        dht + i_n * D * W + o_d[None, :] * W + final_slot[:, None],
+        mask=token_mask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        dx + (bos + token_t[:, None]) * D + o_d[None, :],
+        tl.cast(b_dx, dtype=dx.dtype.element_ty, fp_downcast_rounding="rtne"),
+        mask=token_mask,
+    )
+
 
 @input_guard(make_contiguous=True, auto_to_device=True)
 def causal_conv1d_fwd_impl_old(
@@ -593,7 +959,7 @@ def causal_conv1d_fwd_impl_old(
         bias=bias,
         residual=residual,
         cu_seqlens=cu_seqlens,
-        initial_state=initial_state,
+        initial_state=None,
         chunk_indices=chunk_indices,
         B=B,
         T=T,
@@ -604,7 +970,22 @@ def causal_conv1d_fwd_impl_old(
         ACTIVATION=activation,
         NUM_CHKS=NUM_CHKS,
         NUM_BLKS_D=NUM_BLKS_D,
+        multibuffer=True,
     )
+
+    if initial_state is not None:
+        _causal_conv1d_apply_initial_state(
+            y=y,
+            x=x,
+            weight=weight,
+            H=1,
+            bias=bias,
+            residual=residual,
+            initial_state=initial_state,
+            activation=activation,
+            cu_seqlens=cu_seqlens,
+            output_head_layout=False,
+        )
 
     final_state = None
     if output_final_state:
@@ -664,7 +1045,7 @@ def causal_conv1d_fwd_impl(
         bias=bias,
         residual=residual,
         cu_seqlens=cu_seqlens,
-        initial_state=initial_state,
+        initial_state=None,
         chunk_indices=chunk_indices,
         B=B,
         T=T,
@@ -676,7 +1057,22 @@ def causal_conv1d_fwd_impl(
         ACTIVATION=activation,
         NUM_CHKS=NUM_CHKS,
         NUM_BLKS_D=NUM_BLKS_D,
+        multibuffer=True,
     )
+
+    if initial_state is not None:
+        _causal_conv1d_apply_initial_state(
+            y=y,
+            x=x,
+            weight=weight,
+            H=H,
+            bias=bias,
+            residual=residual,
+            initial_state=initial_state,
+            activation=activation,
+            cu_seqlens=cu_seqlens,
+            output_head_layout=True,
+        )
 
     final_state = None
     if output_final_state:
@@ -715,7 +1111,8 @@ def causal_conv1d_bwd_impl(
     # BT = min(64, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
     BT = min(4, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
 
-    # BD = 64
+    # Keep the full-sequence main kernel on the fast layout. State and final
+    # state gradients are handled by small boundary kernels below.
     BD = 512
     if D < BD:
         BD = D
@@ -747,19 +1144,20 @@ def causal_conv1d_bwd_impl(
             chunk_indices_origin=chunk_indices_origin,
         )
     dx = torch.empty_like(x)
-    dw = weight.new_empty(B * NT, W, D, dtype=torch.float) if weight is not None else None
+    # Some Ascend Triton vector stores may leave masked/aligned tail lanes
+    # untouched.  Zero initialization makes the partial-gradient reduction
+    # deterministic without changing the values written by the kernel.
+    dw = weight.new_zeros(B * NT, W, D, dtype=torch.float) if weight is not None else None
     db = bias.new_empty(B * NT, *bias.shape, dtype=torch.float) if bias is not None else None
     dr = dy if residual is not None else None
 
+    N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
     if initial_state is not None:
-        if cu_seqlens is not None:
-            eff_NT = len(chunk_indices)
-        else:
-            eff_NT = triton.cdiv(T, BT)
-
-        dh0 = initial_state.new_zeros(min(eff_NT, triton.cdiv(W, BT)), *initial_state.shape)
+        dh0 = initial_state.new_zeros(initial_state.shape)
+        dw_state = weight.new_zeros(N, W, D, dtype=torch.float)
     else:
         dh0 = None
+        dw_state = None
 
     grid = (NUM_CORES,)
 
@@ -767,9 +1165,9 @@ def causal_conv1d_bwd_impl(
         x=x,
         y=y,
         weight=weight,
-        initial_state=initial_state,
-        dh0=dh0,
-        dht=dht,
+        initial_state=initial_state if initial_state is not None else x,
+        dh0=dh0 if dh0 is not None else dx,
+        dht=None,
         dy=dy,
         dx=dx,
         dw=dw,
@@ -784,18 +1182,59 @@ def causal_conv1d_bwd_impl(
         BT=BT,
         BD=BD,
         ACTIVATION=activation,
+        USE_INITIAL_STATE=False,
         NUM_Blk_D=NUM_Blk_D,
         NUM_CHKS=NUM_CHKS,
         multibuffer=False,
     )
+
+    if initial_state is not None:
+        state_BD = 128
+        causal_conv1d_state_bwd_kernel[(triton.cdiv(D, state_BD), N)](
+            dy=dy,
+            y=y,
+            weight=weight,
+            initial_state=initial_state,
+            dht=dht,
+            dh0=dh0,
+            dw_state=dw_state,
+            cu_seqlens=cu_seqlens,
+            T=T,
+            D=D,
+            H=H,
+            W=W,
+            BD=state_BD,
+            ACTIVATION=activation,
+            IS_VARLEN=cu_seqlens is not None,
+            USE_FINAL_STATE=dht is not None,
+            multibuffer=False,
+        )
+
+    if dht is not None:
+        tail_BD = 128
+        causal_conv1d_final_state_bwd_kernel[(triton.cdiv(D, tail_BD), N)](
+            dy=dy,
+            y=y if y is not None else x,
+            weight=weight,
+            dht=dht,
+            dx=dx,
+            cu_seqlens=cu_seqlens,
+            T=T,
+            D=D,
+            H=H,
+            W=W,
+            BD=tail_BD,
+            ACTIVATION=activation,
+            IS_VARLEN=cu_seqlens is not None,
+            multibuffer=False,
+        )
     
     if weight is not None:
         dw = dw.sum(0).contiguous().to(weight)
+        if dw_state is not None:
+            dw = dw + dw_state.sum(0).to(weight)
     if bias is not None:
         db = db.sum(0).to(bias)
-    if initial_state is not None:
-        dh0 = dh0.sum(0, dtype=torch.float32).to(initial_state)
-    
     return dx.view(shape), dw, db, dr, dh0
 
 
@@ -852,24 +1291,49 @@ def causal_conv1d_update_states(
     cu_seqlens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, D, W = *x.shape, state_len
-    N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
+    offsets = torch.arange(W, device=x.device, dtype=torch.long)
 
-    final_state = torch.empty(N, D, W, dtype=x.dtype, device=x.device)
-    BD = min(triton.next_power_of_2(D), 256)
-    BW = W
-    grid = (triton.cdiv(D, BD), N)
-    causal_conv1d_states_fwd_kernel[grid](
-        x=x,
-        initial_state=initial_state,
-        final_state=final_state,
-        cu_seqlens=cu_seqlens,
-        T=T,
-        D=D,
-        W=W,
-        BW=BW,
-        BD=BD,
+    if cu_seqlens is None:
+        positions = T - W + offsets
+        valid = positions >= 0
+        safe_positions = positions.clamp(0, max(T - 1, 0))
+        token_state = x.index_select(1, safe_positions).transpose(1, 2)
+        valid = valid.view(1, 1, W).expand(B, 1, W)
+        lengths = torch.full((B,), T, device=x.device, dtype=torch.long)
+        N = B
+    else:
+        assert B == 1, "packed causal-conv state update expects batch size 1"
+        boundaries = cu_seqlens.to(device=x.device, dtype=torch.long)
+        starts, ends = boundaries[:-1], boundaries[1:]
+        positions = ends[:, None] - W + offsets[None, :]
+        valid = positions >= starts[:, None]
+        safe_positions = positions.clamp(0, max(T - 1, 0)).reshape(-1)
+        N = starts.numel()
+        token_state = (
+            x[0]
+            .index_select(0, safe_positions)
+            .reshape(N, W, D)
+            .transpose(1, 2)
+        )
+        valid = valid[:, None, :]
+        lengths = ends - starts
+
+    if initial_state is None:
+        return token_state.masked_fill(~valid, 0)
+
+    assert initial_state.shape == (N, D, W), (
+        f"initial_state must have shape {(N, D, W)}, got {tuple(initial_state.shape)}"
     )
-    return final_state
+    # For a segment shorter than W, prepend the tail of its incoming state.
+    # Example: W=4 and length=1 produces [h1, h2, h3, x0].
+    state_positions = lengths[:, None] + offsets[None, :]
+    state_positions = state_positions.clamp(0, W - 1)
+    history_state = torch.gather(
+        initial_state,
+        2,
+        state_positions[:, None, :].expand(N, D, W),
+    )
+    return torch.where(valid, token_state, history_state)
 
 
 @triton.jit()

@@ -313,6 +313,101 @@ class MultiHeadAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output
 
+    def _prepare_serial_sp_kv_for_fa(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ]:
+        """为当前 chunk 构造 FlashAttention 所需的带历史前缀 KV。
+
+        返回：
+            key_states: 按当前 Q 中 doc 顺序拼接的完整 KV
+            value_states: 按当前 Q 中 doc 顺序拼接的完整 KV
+            cu_seqlens_k: 与拼接后的 KV 对应的边界
+            max_seqlen_k: 当前 batch 内最大的 KV 长度
+
+        同时：
+            若当前 chunk 最后一个 doc 跨越右边界，将该 doc 的当前 KV
+            片段保存到 kvcache，供下一个 chunk 使用。
+        """
+        cache = seq_ctx.kvcache
+        current_chunk_idx = cache.chunk_idx
+        doc_ids = cache.chunk_doc_ids[current_chunk_idx]
+
+        assert doc_ids, f"chunk {current_chunk_idx} has no document"
+        assert len(doc_ids) + 1 == seq_ctx.cu_seq_lens_q.numel(), (
+            f"doc count mismatch: {len(doc_ids)=}, "
+            f"{seq_ctx.cu_seq_lens_q.numel()=}"
+        )
+
+        # 不能覆盖原始当前 KV；保存到 cache 的必须仅是当前 chunk 的 KV。
+        current_key_states = key_states
+        current_value_states = value_states
+        q_cu = seq_ctx.cu_seq_lens_q
+
+        full_k_parts: list[torch.Tensor] = []
+        full_v_parts: list[torch.Tensor] = []
+        k_lens: list[int] = []
+
+        for local_doc_idx, doc_id in enumerate(doc_ids):
+            local_start = int(q_cu[local_doc_idx])
+            local_end = int(q_cu[local_doc_idx + 1])
+
+            # 当前 chunk 中该 doc 对应的 KV。
+            current_k = current_key_states[:, :, local_start:local_end, :]
+            current_v = current_value_states[:, :, local_start:local_end, :]
+
+            # 当前 chunk 的第一个 doc，才可能拥有来自前面 chunk 的 KV 前缀。
+            if local_doc_idx == 0 and cache.history_k is not None:
+                full_k = torch.cat([cache.history_k, current_k], dim=2)
+                full_v = torch.cat([cache.history_v, current_v], dim=2)
+            else:
+                full_k = current_k
+                full_v = current_v
+
+            full_k_parts.append(full_k)
+            full_v_parts.append(full_v)
+            k_lens.append(full_k.size(2))
+
+        # Q 的 doc 顺序未变，因此 KV 必须以相同 doc 顺序拼接。
+        key_states = torch.cat(full_k_parts, dim=2)
+        value_states = torch.cat(full_v_parts, dim=2)
+
+        cu_seqlens_k = torch.tensor(
+            [0, *k_lens],
+            dtype=torch.int32,
+            device=key_states.device,
+        ).cumsum(dim=0).to(torch.int32)
+
+        # 当前 chunk 最后一个 doc 是唯一可能跨越右边界、需要保存 cache 的 doc。
+        last_local_doc_idx = len(doc_ids) - 1
+        last_doc_id = doc_ids[-1]
+        _, last_doc_end = cache.doc_ranges[last_doc_id]
+
+        chunk_end = (current_chunk_idx + 1) * cache.chunk_size
+        local_start = int(q_cu[last_local_doc_idx])
+        local_end = int(q_cu[last_local_doc_idx + 1])
+        current_last_k = current_key_states[:, :, local_start:local_end, :].clone()
+        current_last_v = current_value_states[:, :, local_start:local_end, :].clone()
+        if last_doc_end > chunk_end:
+            if last_local_doc_idx == 0 and cache.history_k is not None:
+                cache.output_k = torch.cat([cache.history_k, current_last_k], dim=2)
+                cache.output_v = torch.cat([cache.history_v, current_last_v], dim=2)
+            else:
+                cache.output_k = current_last_k
+                cache.output_v = current_last_v
+        else:
+            cache.output_k = current_last_k[:, :, :0, :]
+            cache.output_v = current_last_v[:, :, :0, :]
+
+        return key_states, value_states, cu_seqlens_k, max(k_lens)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -404,15 +499,24 @@ class MultiHeadAttention(nn.Module):
         
         # event_timer.add_tensor_shape("mha_query", query_states)
         fa_lens = seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]
+        if hasattr(seq_ctx, "kvcache") and seq_ctx.kvcache is not None:
+            key_states, value_states, cu_seqlens_k, max_seqlen_k = self._prepare_serial_sp_kv_for_fa(
+                key_states,
+                value_states,
+                seq_ctx,
+            )
+        else:
+            cu_seqlens_k = seq_ctx.cu_seq_lens_k
+            max_seqlen_k = seq_ctx.max_length_k
         # event_timer.add_tensor("cu_seq_lens", fa_lens)
         attn_op_outputs = self.attn_impl_func(
             query_states,
             key_states,
             value_states,
-            cu_seqlens_q=seq_ctx.cu_seq_lens_q_list  if hasattr(seq_ctx, "cu_seq_lens_q_list") else seq_ctx.cu_seq_lens_q,
-            cu_seqlens_k=seq_ctx.cu_seq_lens_k_list  if hasattr(seq_ctx, "cu_seq_lens_k_list") else seq_ctx.cu_seq_lens_k,
+            cu_seqlens_q=seq_ctx.cu_seq_lens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=seq_ctx.max_length_q,
-            max_seqlen_k=seq_ctx.max_length_k,
+            max_seqlen_k=max_seqlen_k,
             window_size=self.window_size,
             dropout_p=self.dropout,
             softmax_scale=self.scaling,

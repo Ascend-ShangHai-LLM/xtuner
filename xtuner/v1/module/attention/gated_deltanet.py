@@ -421,13 +421,66 @@ class GatedDeltaNet(nn.Module):
         }
         return attn_outputs
 
+    def _serial_sp_initial_states(
+        self,
+        hidden_states: torch.Tensor,
+        cache,
+        num_docs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        conv_shape = (1, self.conv_dim, self.conv_kernel_size)
+        conv_history = cache.history_conv_state
+        if conv_history is not None and conv_history.numel() > 0:
+            first_conv = conv_history.unsqueeze(0) if conv_history.ndim == 2 else conv_history
+        else:
+            first_conv = hidden_states.new_zeros(conv_shape)
+        conv_rest = hidden_states.new_zeros((num_docs - 1, *conv_shape[1:]))
+
+        delta_shape = (
+            1,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        )
+        delta_history = cache.history_delta_state
+        if delta_history is not None and delta_history.numel() > 0:
+            first_delta = delta_history.unsqueeze(0) if delta_history.ndim == 3 else delta_history
+        else:
+            first_delta = hidden_states.new_zeros(delta_shape)
+        delta_rest = hidden_states.new_zeros((num_docs - 1, *delta_shape[1:]))
+
+        return (
+            torch.cat((first_conv, conv_rest), dim=0),
+            torch.cat((first_delta, delta_rest), dim=0),
+        )
+
+    def _store_serial_sp_final_states(
+        self,
+        cache,
+        final_conv_state: torch.Tensor,
+        final_delta_state: torch.Tensor,
+    ) -> None:
+        doc_ids = cache.chunk_doc_ids[cache.chunk_idx]
+        assert doc_ids, f"chunk {cache.chunk_idx} has no document"
+        assert len(doc_ids) == final_conv_state.shape[0] == final_delta_state.shape[0]
+
+        last_doc_end = cache.doc_ranges[doc_ids[-1]][1]
+        chunk_end = (cache.chunk_idx + 1) * cache.chunk_size
+        if last_doc_end > chunk_end:
+            cache.output_conv_state = final_conv_state[-1].clone()
+            cache.output_delta_state = final_delta_state[-1].clone()
+        else:
+            cache.output_conv_state = final_conv_state[:0].clone()
+            cache.output_delta_state = final_delta_state[:0].clone()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # not used
     ) -> AttnOutputs:
+        cache = getattr(seq_ctx, "kvcache", None)
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
+            assert cache is None, "serial-SP GDN state carry currently requires sequence_parallel_size=1"
             return self.forward_for_sp(hidden_states, seq_ctx, position_embeddings)
 
         batch_size, seq_len, _ = hidden_states.shape
@@ -444,8 +497,19 @@ class GatedDeltaNet(nn.Module):
         bias = self.conv1d.bias
         if isinstance(weight, DTensor):
             weight = weight.to_local()
-        if bias and isinstance(bias, DTensor):
+        if bias is not None and isinstance(bias, DTensor):
             bias = bias.to_local()
+
+        initial_conv_state = None
+        initial_delta_state = None
+        if cache is not None:
+            num_docs = seq_ctx.cu_seq_lens_q.numel() - 1
+            assert num_docs == len(cache.chunk_doc_ids[cache.chunk_idx])
+            initial_conv_state, initial_delta_state = self._serial_sp_initial_states(
+                hidden_states,
+                cache,
+                num_docs,
+            )
 
         if seq_ctx.seq_idx is None:
             # Keep seq_idx generation in a custom op so full-graph compile avoids Python tensor construction.
@@ -456,7 +520,20 @@ class GatedDeltaNet(nn.Module):
 
         # TODO: due to the limitation of scatter_dim=1 in ulysses_all_to_all,
         # the implementation is very inelegant and inefficient, and needs to be refactored in the future.
-        if self.causal_conv1d_fn is not None:
+        final_conv_state = None
+        if cache is not None:
+            mixed_qkv, final_conv_state = causal_conv1d_triton(
+                x=mixed_qkv,
+                weight=weight,
+                H=2 * self.num_k_heads + self.num_v_heads,
+                bias=bias,
+                initial_state=initial_conv_state,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+                chunk_indices=seq_ctx.chunk_indices,
+                output_final_state=True,
+            )
+        elif self.causal_conv1d_fn is not None:
             mixed_qkv = mixed_qkv.transpose(1, 2)
             mixed_qkv = self.causal_conv1d_fn(
                 x=mixed_qkv,  # need non contiguous
@@ -512,20 +589,28 @@ class GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
         
-        core_attn_out, _ = self.chunk_gated_delta_rule(
+        core_attn_out, final_delta_state = self.chunk_gated_delta_rule(
             query,
             key,
             value,
             g=g,
             beta=beta,
-            initial_state=None,
-            output_final_state=False,
+            initial_state=initial_delta_state,
+            output_final_state=cache is not None,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q,
             cu_seqlens_list=seq_ctx.cu_seq_lens_list,
             chunk_indices=seq_ctx.chunk_indices,
             chunk_indices_list=seq_ctx.chunk_indices_list 
         )
+
+        if cache is not None:
+            assert final_conv_state is not None and final_delta_state is not None
+            self._store_serial_sp_final_states(
+                cache,
+                final_conv_state,
+                final_delta_state,
+            )
         
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)

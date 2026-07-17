@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import os
 import types
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, List, Literal, Self, Sequence, TypedDict, cast
 
@@ -702,6 +703,219 @@ class MoE(BaseModel):
         return MoEModelOutputs(**output, logits=logits)
 
 
+    class KVCache:
+        def __init__(
+            self,
+            seq_ctx: SequenceContext,
+            chunk_size: int,
+            num_chunks: int,
+            chunk_idx: int,
+            history_k: torch.Tensor | None,
+            history_v: torch.Tensor | None,
+        ):
+            self.chunk_size = chunk_size
+            self.chunk_idx = chunk_idx
+            self.history_k = history_k
+            self.history_v = history_v
+            self.output_k: torch.Tensor | None = None
+            self.output_v: torch.Tensor | None = None
+            self.history_conv_state: torch.Tensor | None = None
+            self.history_delta_state: torch.Tensor | None = None
+            self.output_conv_state: torch.Tensor | None = None
+            self.output_delta_state: torch.Tensor | None = None
+            self.doc_ranges = [
+                (int(start), int(end))
+                for start, end in zip(seq_ctx.cu_seq_lens_q[:-1], seq_ctx.cu_seq_lens_q[1:])
+            ]
+            self.doc_to_start_chunk = {
+                doc_id: doc_start // chunk_size
+                for doc_id, (doc_start, _) in enumerate(self.doc_ranges)
+            }
+            self.chunk_doc_ids = [
+                [
+                    doc_id
+                    for doc_id, (doc_start, doc_end) in enumerate(self.doc_ranges)
+                    if max(doc_start, chunk_idx * chunk_size)
+                    < min(doc_end, (chunk_idx + 1) * chunk_size)
+                ]
+                for chunk_idx in range(num_chunks)
+            ]
+    def _wrap_serial_sp_decoder_layer_forward(self, layer: nn.Module) -> nn.Module:
+        if getattr(layer, "_serial_sp_forward_wrapped", False):
+            return layer
+        layer.forward = partial(
+            self._decoder_layer_serial_sp_forward,
+            decoder_layer_forward=layer.forward,
+        )
+        setattr(layer, "_serial_sp_forward_wrapped", True)
+        return layer
+
+    def _generate_seq_ctx_chunks(
+        self, seq_ctx: SequenceContext, chunks: int
+    ) -> list[SequenceContext]:
+        seq_len = int(seq_ctx.cu_seq_lens_q[-1])
+        assert chunks > 0 and seq_len % chunks == 0
+        chunk_size = seq_len // chunks
+        doc_ranges = [
+            (int(start), int(end))
+            for start, end in zip(seq_ctx.cu_seq_lens_q[:-1], seq_ctx.cu_seq_lens_q[1:])
+        ]
+        result: list[SequenceContext] = []
+
+        for chunk_idx in range(chunks):
+            start = chunk_idx * chunk_size
+            end = start + chunk_size
+            local_lens = [
+                min(doc_end, end) - max(doc_start, start)
+                for doc_start, doc_end in doc_ranges
+                if max(doc_start, start) < min(doc_end, end)
+            ]
+            cu_seq_lens = torch.tensor(
+                [0, *torch.tensor(local_lens).cumsum(0).tolist()],
+                dtype=torch.int32,
+                device=seq_ctx.inputs_embeds.device,
+            )
+            chunk_seq_ctx = seq_ctx.__class__(
+                input_ids=seq_ctx.input_ids[:, start:end] if seq_ctx.input_ids is not None else None,
+                cu_seq_lens_q=cu_seq_lens,
+                cu_seq_lens_k=cu_seq_lens,
+                max_length_q=max(local_lens, default=0),
+                max_length_k=max(local_lens, default=0),
+                num_padding=max(
+                    0,
+                    min(
+                        chunk_size,
+                        end - (seq_len - seq_ctx.num_padding),
+                    ),
+                ),
+                position_ids=(
+                    seq_ctx.position_ids[..., start:end]
+                    if seq_ctx.position_ids is not None
+                    else None
+                ),
+                block_table=seq_ctx.block_table,
+                device=seq_ctx.inputs_embeds.device,
+                sequence_parallel_mesh=seq_ctx.sequence_parallel_mesh,
+                pixel_values=seq_ctx.pixel_values,
+                image_grid_thw=seq_ctx.image_grid_thw,
+                inputs_embeds=(
+                    seq_ctx.inputs_embeds[:, start:end, ...]
+                    if seq_ctx.inputs_embeds is not None
+                    else None
+                ),
+                num_img_tokens=seq_ctx.num_img_tokens,
+                rollout_routed_experts=(
+                    seq_ctx.rollout_routed_experts[start:end]
+                    if seq_ctx.rollout_routed_experts is not None
+                    else None
+                ),
+                raw_input_ids=seq_ctx.packed_input_ids if seq_ctx.input_ids is not None else None,
+                shard_start=start,
+                shard_size=chunk_size,
+            )
+            self.prepare_chunk_indices_all(chunk_seq_ctx)
+            result.append(chunk_seq_ctx)
+        return result
+
+    def _decoder_layer_serial_sp_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        seq_ctx: SequenceContext,
+        layer_idx: int,
+        *,
+        decoder_layer_forward,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        chunks = int(os.getenv("XTUNER_SERIAL_SP_CHUNKS", "1"))
+        if chunks < 2:
+            return decoder_layer_forward(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                layer_idx=layer_idx,
+            )
+        # if torch.distributed.get_rank()==0:
+        #     breakpoint()
+        # torch.distributed.barrier()
+        seq_len = int(seq_ctx.cu_seq_lens_q[-1])
+        assert seq_len % chunks == 0, (
+            f"seq_len {seq_len} must be divisible by chunks {chunks}"
+        )
+        chunk_size = seq_len // chunks
+        chunk_seq_ctxs = self._generate_seq_ctx_chunks(seq_ctx, chunks)
+
+        hidden_outputs: list[torch.Tensor] = []
+        router_outputs: list[torch.Tensor] = []
+        router_weights: list[torch.Tensor] = []
+        history_k = None
+        history_v = None
+        for chunk_idx, chunk_seq_ctx in enumerate(chunk_seq_ctxs):
+            kvcache = self.KVCache(
+                seq_ctx,
+                chunk_size,
+                chunks,
+                chunk_idx,
+                history_k,
+                history_v,
+            )
+            chunk_seq_ctx.kvcache = kvcache
+            start = chunk_idx * chunk_size
+            end = start + chunk_size
+            chunk_input = hidden_states[:, start:end, :].clone()
+            chunk_position_embeddings = (
+                position_embeddings[0][:, start:end, ...].clone(),
+                position_embeddings[1][:, start:end, ...].clone(),
+            )
+
+            history_k_input = history_k
+            history_v_input = history_v
+
+            offload_ptrs = {
+                tensor.data_ptr()
+                for tensor in (
+                    chunk_input,
+                    history_k_input,
+                    history_v_input,
+                )
+                if tensor is not None and tensor.untyped_storage().size() > 0
+            }
+
+            def should_offload(tensor):
+                return tensor.data_ptr() in offload_ptrs
+            import contextlib
+            if True:
+                offload_ctx = async_save_on_cpu(
+                    h2d_stream=self.offload_stream,
+                    d2h_stream=self.offload_stream,
+                    block_idx=((layer_idx - self.config.first_k_dense_replace) * chunks + chunk_idx),
+                    group="chunk_text",
+                    custom_check_fn=should_offload,
+                )
+            else:
+                offload_ctx = contextlib.nullcontext()
+            with offload_ctx:
+                output = decoder_layer_forward(
+                    chunk_input,
+                    position_embeddings=chunk_position_embeddings,
+                    seq_ctx=chunk_seq_ctx,
+                    layer_idx=layer_idx,
+                    serial_sp_history_k=history_k,
+                    serial_sp_history_v=history_v,
+                )
+            chunk_output, chunk_router, chunk_weights, next_history_k, next_history_v = output
+            history_k = next_history_k
+            history_v = next_history_v
+
+            hidden_outputs.append(chunk_output)
+            router_outputs.append(chunk_router)
+            router_weights.append(chunk_weights)
+
+        return (
+            torch.cat(hidden_outputs, dim=1),
+            torch.cat(router_outputs, dim=0),
+            torch.cat(router_weights, dim=0),
+        )
+
     def _forward(
         self,
         seq_ctx: SequenceContext,  # todo(@yehaochen): support intra layer micro-batch
@@ -750,7 +964,9 @@ class MoE(BaseModel):
         non_pad_token = nonpad_indices.numel()
         num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
-        
+        # if torch.distributed.get_rank()==0:
+        #     breakpoint()
+        # torch.distributed.barrier()
         for idx, decoder_layer in self.layers.items():
             if int(idx) < self.config.first_k_dense_replace:
                 hidden_states = decoder_layer(
@@ -1098,11 +1314,18 @@ class MoE(BaseModel):
 
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
+            use_serial_sp = (
+                int(os.getenv("XTUNER_SERIAL_SP_CHUNKS", "1")) > 1
+                and layer_idx >= self.config.first_k_dense_replace
+                and layer.self_attn.__class__.__name__ in ("MultiHeadAttention", "GatedDeltaNet")
+            )
             if self._should_recompute(
                 layer_idx=layer_idx,
                 mtp_idx=None,
-            ):
+            ) or True:
                 layer = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
+            if use_serial_sp:
+                layer = self._wrap_serial_sp_decoder_layer_forward(layer)
 
             self.layers[str(layer_idx)] = layer
             if layer_idx >= len(self.layers) - 1 and self.mtp_block is None:
